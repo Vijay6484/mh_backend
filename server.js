@@ -243,16 +243,35 @@ app.get('/api/search', (req, res) => {
     try {
         const raw = fs.readFileSync(filePath, 'utf8');
         const records = JSON.parse(raw);
-        const results = [];
+        const matched = [];
         for (const record of records) {
             if (record.property_numbers && Array.isArray(record.property_numbers)) {
                 for (const prop of record.property_numbers) {
                     const baseNumber = String(prop.value).split(/[\/\-]/)[0].trim();
-                    if (baseNumber === String(queryNumber)) { results.push(record); break; }
+                    if (baseNumber === String(queryNumber)) { matched.push(record); break; }
                 }
             }
         }
-        res.json({ count: results.length, results });
+
+        // SECURITY: This endpoint is public. Do not expose full indexed records here.
+        // Default response only returns the document type needed for the blurred UI.
+        //
+        // If you need full records (e.g. post-payment), call this endpoint with:
+        // - Header:  x-full-search-key: <SEARCH_FULL_API_KEY>
+        // - Query:   full=1
+        const wantsFull = String(req.query.full || '').toLowerCase() === '1';
+        const providedKey = req.get('x-full-search-key') || '';
+        const serverKey = process.env.SEARCH_FULL_API_KEY || '';
+        const allowFull = Boolean(serverKey) && wantsFull && providedKey === serverKey;
+
+        if (allowFull) {
+            return res.json({ count: matched.length, results: matched });
+        }
+
+        const results = matched.map(r => ({
+            document_type: r.document_type || 'Unknown'
+        }));
+        return res.json({ count: results.length, results });
     } catch (error) {
         console.error('[api/search] Failed reading/parsing data.json', {
             filePath,
