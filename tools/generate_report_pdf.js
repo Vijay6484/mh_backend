@@ -17,7 +17,8 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { jsPDF } = require('jspdf');
-const autoTable = require('jspdf-autotable');
+// In CommonJS, jspdf-autotable exposes the function under `.default`
+const autoTable = require('jspdf-autotable').default;
 
 function parseArgs(argv) {
     const args = {};
