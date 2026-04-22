@@ -253,24 +253,43 @@ app.get('/api/search', (req, res) => {
             }
         }
 
-        // Dedupe by full record equality (all key/value pairs).
-        // Use a stable (key-order independent) JSON fingerprint so we can dedupe in O(n).
-        const stableStringify = (value) => {
-            if (value === null) return 'null';
+        // Dedupe key is generated from the block of fields between `document_number`
+        // and `pdf_link` (both inclusive), so records that differ only in fields
+        // like `doc_id` / `serial_number` / `village` / `year` still collapse into one.
+        //
+        // Strings are normalized (trim + NFC). Objects/arrays are canonicalized
+        // (object keys sorted, array items sorted) so order differences don't change the key.
+        const IDENTITY_FIELDS = [
+            'document_number',
+            'document_type',
+            'registration_office',
+            'date',
+            'seller_party',
+            'buyer_party',
+            'text',
+            'property_numbers',
+            'pdf_link',
+        ];
+
+        const canonicalize = (value) => {
+            if (value === null || value === undefined) return 'null';
             const t = typeof value;
-            if (t === 'string' || t === 'number' || t === 'boolean') return JSON.stringify(value);
-            if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+            if (t === 'string') return JSON.stringify(String(value).trim().normalize('NFC'));
+            if (t === 'number' || t === 'boolean') return JSON.stringify(value);
+            if (Array.isArray(value)) {
+                const items = value.map(canonicalize).sort();
+                return `[${items.join(',')}]`;
+            }
             if (t === 'object') {
                 const keys = Object.keys(value).sort();
-                return `{${keys.map(k => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`;
+                return `{${keys.map(k => `${JSON.stringify(k)}:${canonicalize(value[k])}`).join(',')}}`;
             }
-            // JSON.parse output shouldn't contain undefined/functions/symbols, but guard anyway.
-            return JSON.stringify(null);
+            return 'null';
         };
 
         const fingerprint = (record) => {
-            const canonical = stableStringify(record);
-            return crypto.createHash('sha256').update(canonical).digest('base64url');
+            const parts = IDENTITY_FIELDS.map(k => canonicalize(record ? record[k] : undefined));
+            return crypto.createHash('sha256').update(parts.join('|')).digest('base64url');
         };
 
         const seenDocs = new Set();
