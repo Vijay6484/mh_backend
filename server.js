@@ -459,14 +459,18 @@ app.post('/api/search/full-by-keys', (req, res) => {
 // POST { amount, productinfo, firstname, email, phone, query }
 // Returns: PayU form fields + hash for frontend to submit
 app.post('/api/payu/initiate', (req, res) => {
-    const { amount, productinfo, firstname, email, phone, searchQuery } = req.body;
+    const { productinfo, firstname, email, phone, searchQuery } = req.body;
 
-    if (!amount || !productinfo || !firstname || !email || !phone) {
+    if (!productinfo || !firstname || !email || !phone) {
         return res.status(400).json({ error: 'Missing payment fields' });
     }
 
+    // Pricing is enforced server-side so clients cannot tamper with amount.
+    const REPORT_FEE_INR = 699;
+    const GST_RATE = 0.18;
+    const amtFixed = (REPORT_FEE_INR * (1 + GST_RATE)).toFixed(2);
+
     const txnid    = `MSC_${Date.now()}_${Math.random().toString(36).substr(2, 6).toUpperCase()}`;
-    const amtFixed = parseFloat(amount).toFixed(2);
     const udf1     = searchQuery || '';   // store search query for post-payment use
 
     const hash = generatePayUHash({
