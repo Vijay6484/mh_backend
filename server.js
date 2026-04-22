@@ -294,11 +294,14 @@ app.get('/api/search', (req, res) => {
         const allowFull = Boolean(serverKey) && wantsFull && providedKey === serverKey;
 
         if (allowFull) {
-            return res.json({ count: uniqueMatched.length, results: uniqueMatched });
+            // For internal use you may still want a stable key for each record.
+            const results = uniqueMatched.map(r => ({ ...r, key: fingerprint(r) }));
+            return res.json({ count: results.length, results });
         }
 
         const results = uniqueMatched.map(r => ({
-            document_type: r.document_type || 'Unknown'
+            document_type: r.document_type || 'Unknown',
+            key: fingerprint(r)
         }));
         return res.json({ count: results.length, results });
     } catch (error) {
