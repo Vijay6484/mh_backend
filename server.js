@@ -15,7 +15,33 @@ app.use(express.json());
 // PayU posts back as form-urlencoded
 app.use(express.urlencoded({ extended: true }));
 
-const INDEX_DIR = path.join(__dirname, 'indexed_data');
+const INDEX_DIR = process.env.INDEX_DIR
+    ? path.resolve(process.env.INDEX_DIR)
+    : path.join(__dirname, 'indexed_data');
+
+function normalizeFsKey(s) {
+    // Make user input and on-disk names comparable across platforms.
+    // - trim to avoid accidental spaces
+    // - NFC to reduce Unicode normalization mismatches (common with Indic scripts)
+    return String(s ?? '').trim().normalize('NFC');
+}
+
+function resolveDirEntry(parentDir, requestedName) {
+    const req = normalizeFsKey(requestedName);
+    const exact = path.join(parentDir, requestedName);
+    if (fs.existsSync(exact)) return requestedName;
+
+    if (!fs.existsSync(parentDir)) return null;
+    try {
+        const entries = fs.readdirSync(parentDir, { withFileTypes: true })
+            .filter(d => d.isDirectory() && !d.name.startsWith('.'))
+            .map(d => d.name);
+        const match = entries.find(name => normalizeFsKey(name) === req);
+        return match || null;
+    } catch {
+        return null;
+    }
+}
 
 // ─── PayU Config (from .env) ──────────────────────────────────────────────────
 const PAYU_KEY     = process.env.PAYU_MERCHANT_KEY;
@@ -176,28 +202,67 @@ app.get('/api/search', (req, res) => {
     const { district, taluka, village, query } = req.query;
     if (!district || !taluka || !village || !query)
         return res.status(400).json({ error: 'Missing required parameters' });
-    if (!/^\d+$/.test(query))
-        return res.status(400).json({ error: 'Query must be numeric' });
+    // Accept common user inputs like "74," or "74/1" and extract the leading number.
+    const queryMatch = String(query).trim().match(/\d+/);
+    if (!queryMatch)
+        return res.status(400).json({ error: 'Query must contain a number' });
+    const queryNumber = queryMatch[0];
 
-    const filePath = path.join(INDEX_DIR, district, taluka, village, 'data.json');
-    if (!fs.existsSync(filePath))
-        return res.status(404).json({ error: 'Data file not found for the selected location' });
+    if (!fs.existsSync(INDEX_DIR)) {
+        return res.status(500).json({
+            error: 'Index directory not found on server',
+            details: { indexDir: INDEX_DIR }
+        });
+    }
+
+    const resolvedDistrict = resolveDirEntry(INDEX_DIR, district);
+    if (!resolvedDistrict) {
+        return res.status(404).json({ error: 'District not found in index' });
+    }
+
+    const districtDir = path.join(INDEX_DIR, resolvedDistrict);
+    const resolvedTaluka = resolveDirEntry(districtDir, taluka);
+    if (!resolvedTaluka) {
+        return res.status(404).json({ error: 'Taluka not found in index' });
+    }
+
+    const talukaDir = path.join(districtDir, resolvedTaluka);
+    const resolvedVillage = resolveDirEntry(talukaDir, village);
+    if (!resolvedVillage) {
+        return res.status(404).json({ error: 'Village not found in index' });
+    }
+
+    const filePath = path.join(talukaDir, resolvedVillage, 'data.json');
+    if (!fs.existsSync(filePath)) {
+        return res.status(404).json({
+            error: 'Data file not found for the selected location',
+            details: { filePath }
+        });
+    }
 
     try {
-        const records = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+        const raw = fs.readFileSync(filePath, 'utf8');
+        const records = JSON.parse(raw);
         const results = [];
         for (const record of records) {
             if (record.property_numbers && Array.isArray(record.property_numbers)) {
                 for (const prop of record.property_numbers) {
                     const baseNumber = String(prop.value).split(/[\/\-]/)[0].trim();
-                    if (baseNumber === String(query)) { results.push(record); break; }
+                    if (baseNumber === String(queryNumber)) { results.push(record); break; }
                 }
             }
         }
         res.json({ count: results.length, results });
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: 'Internal server error reading data file' });
+        console.error('[api/search] Failed reading/parsing data.json', {
+            filePath,
+            message: error && error.message
+        });
+        // Most common real-world cause here is a partially-written or malformed JSON file.
+        res.status(422).json({
+            error: 'Indexed data file is not valid JSON',
+            details: { filePath }
+        });
     }
 });
 
