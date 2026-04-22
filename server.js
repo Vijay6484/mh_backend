@@ -253,6 +253,35 @@ app.get('/api/search', (req, res) => {
             }
         }
 
+        // Dedupe by full record equality (all key/value pairs).
+        // Use a stable (key-order independent) JSON fingerprint so we can dedupe in O(n).
+        const stableStringify = (value) => {
+            if (value === null) return 'null';
+            const t = typeof value;
+            if (t === 'string' || t === 'number' || t === 'boolean') return JSON.stringify(value);
+            if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+            if (t === 'object') {
+                const keys = Object.keys(value).sort();
+                return `{${keys.map(k => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`;
+            }
+            // JSON.parse output shouldn't contain undefined/functions/symbols, but guard anyway.
+            return JSON.stringify(null);
+        };
+
+        const fingerprint = (record) => {
+            const canonical = stableStringify(record);
+            return crypto.createHash('sha256').update(canonical).digest('base64url');
+        };
+
+        const seenDocs = new Set();
+        const uniqueMatched = [];
+        for (const r of matched) {
+            const fp = fingerprint(r);
+            if (seenDocs.has(fp)) continue;
+            seenDocs.add(fp);
+            uniqueMatched.push(r);
+        }
+
         // SECURITY: This endpoint is public. Do not expose full indexed records here.
         // Default response only returns the document type needed for the blurred UI.
         //
@@ -265,10 +294,10 @@ app.get('/api/search', (req, res) => {
         const allowFull = Boolean(serverKey) && wantsFull && providedKey === serverKey;
 
         if (allowFull) {
-            return res.json({ count: matched.length, results: matched });
+            return res.json({ count: uniqueMatched.length, results: uniqueMatched });
         }
 
-        const results = matched.map(r => ({
+        const results = uniqueMatched.map(r => ({
             document_type: r.document_type || 'Unknown'
         }));
         return res.json({ count: results.length, results });
