@@ -19,6 +19,18 @@ const INDEX_DIR = process.env.INDEX_DIR
     ? path.resolve(process.env.INDEX_DIR)
     : path.join(__dirname, 'indexed_data');
 
+// Short-lived tokens issued after successful PayU verification.
+// Stored in-memory (process-local). If the server restarts, tokens are cleared.
+const PAYMENT_TOKENS = new Map(); // token -> { txnid, exp }
+const PAYMENT_TOKEN_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+function issuePaymentToken(txnid) {
+    const token = crypto.randomBytes(24).toString('base64url');
+    const exp = Date.now() + PAYMENT_TOKEN_TTL_MS;
+    PAYMENT_TOKENS.set(token, { txnid, exp });
+    return { token, exp };
+}
+
 function normalizeFsKey(s) {
     // Make user input and on-disk names comparable across platforms.
     // - trim to avoid accidental spaces
@@ -292,15 +304,6 @@ app.get('/api/search', (req, res) => {
             return crypto.createHash('sha256').update(parts.join('|')).digest('base64url');
         };
 
-        const seenDocs = new Set();
-        const uniqueMatched = [];
-        for (const r of matched) {
-            const fp = fingerprint(r);
-            if (seenDocs.has(fp)) continue;
-            seenDocs.add(fp);
-            uniqueMatched.push(r);
-        }
-
         // SECURITY: This endpoint is public. Do not expose full indexed records here.
         // Default response only returns the document type needed for the blurred UI.
         //
@@ -314,11 +317,11 @@ app.get('/api/search', (req, res) => {
 
         if (allowFull) {
             // For internal use you may still want a stable key for each record.
-            const results = uniqueMatched.map(r => ({ ...r, key: fingerprint(r) }));
+            const results = matched.map(r => ({ ...r, key: fingerprint(r) }));
             return res.json({ count: results.length, results });
         }
 
-        const results = uniqueMatched.map(r => ({
+        const results = matched.map(r => ({
             document_type: r.document_type || 'Unknown',
             key: fingerprint(r)
         }));
@@ -333,6 +336,122 @@ app.get('/api/search', (req, res) => {
             error: 'Indexed data file is not valid JSON',
             details: { filePath }
         });
+    }
+});
+
+// ─── /api/search/full-by-keys ─────────────────────────────────────────────────
+// POST { token, district, taluka, village, query, keys: [] }
+// Returns full records matching those SHA keys (for post-payment PDF generation).
+app.post('/api/search/full-by-keys', (req, res) => {
+    const { token, district, taluka, village, query, keys } = req.body || {};
+
+    if (!token) return res.status(401).json({ error: 'Missing token' });
+    const t = PAYMENT_TOKENS.get(token);
+    if (!t) return res.status(401).json({ error: 'Invalid token' });
+    if (Date.now() > t.exp) {
+        PAYMENT_TOKENS.delete(token);
+        return res.status(401).json({ error: 'Token expired' });
+    }
+
+    if (!district || !taluka || !village || !query) {
+        return res.status(400).json({ error: 'Missing required parameters' });
+    }
+    if (!Array.isArray(keys) || keys.length === 0) {
+        return res.status(400).json({ error: 'Missing keys' });
+    }
+
+    const queryMatch = String(query).trim().match(/\d+/);
+    if (!queryMatch) return res.status(400).json({ error: 'Query must contain a number' });
+    const queryNumber = queryMatch[0];
+
+    if (!fs.existsSync(INDEX_DIR)) {
+        return res.status(500).json({
+            error: 'Index directory not found on server',
+            details: { indexDir: INDEX_DIR }
+        });
+    }
+
+    const resolvedDistrict = resolveDirEntry(INDEX_DIR, district);
+    if (!resolvedDistrict) return res.status(404).json({ error: 'District not found in index' });
+    const districtDir = path.join(INDEX_DIR, resolvedDistrict);
+
+    const resolvedTaluka = resolveDirEntry(districtDir, taluka);
+    if (!resolvedTaluka) return res.status(404).json({ error: 'Taluka not found in index' });
+    const talukaDir = path.join(districtDir, resolvedTaluka);
+
+    const resolvedVillage = resolveDirEntry(talukaDir, village);
+    if (!resolvedVillage) return res.status(404).json({ error: 'Village not found in index' });
+
+    const filePath = path.join(talukaDir, resolvedVillage, 'data.json');
+    if (!fs.existsSync(filePath)) {
+        return res.status(404).json({
+            error: 'Data file not found for the selected location',
+            details: { filePath }
+        });
+    }
+
+    // Fingerprint must match /api/search output
+    const IDENTITY_FIELDS = [
+        'document_number',
+        'document_type',
+        'registration_office',
+        'date',
+        'seller_party',
+        'buyer_party',
+        'text',
+        'property_numbers',
+        'pdf_link',
+    ];
+    const canonicalize = (value) => {
+        if (value === null || value === undefined) return 'null';
+        const typ = typeof value;
+        if (typ === 'string') return JSON.stringify(String(value).trim().normalize('NFC'));
+        if (typ === 'number' || typ === 'boolean') return JSON.stringify(value);
+        if (Array.isArray(value)) {
+            const items = value.map(canonicalize).sort();
+            return `[${items.join(',')}]`;
+        }
+        if (typ === 'object') {
+            const objKeys = Object.keys(value).sort();
+            return `{${objKeys.map(k => `${JSON.stringify(k)}:${canonicalize(value[k])}`).join(',')}}`;
+        }
+        return 'null';
+    };
+    const fingerprint = (record) => {
+        const parts = IDENTITY_FIELDS.map(k => canonicalize(record ? record[k] : undefined));
+        return crypto.createHash('sha256').update(parts.join('|')).digest('base64url');
+    };
+
+    try {
+        const raw = fs.readFileSync(filePath, 'utf8');
+        const records = JSON.parse(raw);
+
+        const keySet = new Set(keys.filter(Boolean));
+        const results = [];
+        for (const record of records) {
+            if (record.property_numbers && Array.isArray(record.property_numbers)) {
+                let isMatch = false;
+                for (const prop of record.property_numbers) {
+                    const baseNumber = String(prop.value).split(/[\/\-]/)[0].trim();
+                    if (baseNumber === String(queryNumber)) { isMatch = true; break; }
+                }
+                if (!isMatch) continue;
+            } else {
+                continue;
+            }
+
+            const k = fingerprint(record);
+            if (!keySet.has(k)) continue;
+            results.push({ ...record, key: k });
+        }
+
+        return res.json({ count: results.length, results });
+    } catch (error) {
+        console.error('[api/search/full-by-keys] Failed reading/parsing data.json', {
+            filePath,
+            message: error && error.message
+        });
+        return res.status(422).json({ error: 'Indexed data file is not valid JSON', details: { filePath } });
     }
 });
 
@@ -363,11 +482,32 @@ app.post('/api/payu/initiate', (req, res) => {
         email,
         phone,
         udf1,
-        surl:        `${process.env.FRONTEND_URL || 'http://localhost:3000'}/payment-success`,
-        furl:        `${process.env.FRONTEND_URL || 'http://localhost:3000'}/payment-failure`,
+        // PayU typically POSTs to surl/furl. Our React SPA cannot receive POST directly.
+        // So PayU posts to backend, we verify + mint token, then redirect to frontend.
+        surl:        `${process.env.BACKEND_URL || 'https://api.mahasuchi.com'}/api/payu/success`,
+        furl:        `${process.env.BACKEND_URL || 'https://api.mahasuchi.com'}/api/payu/failure`,
         hash,
         action:      PAYU_URL
     });
+});
+
+// ─── PayU redirect handlers (receive POST, then redirect to frontend) ──────────
+app.post('/api/payu/success', (req, res) => {
+    const params = req.body || {};
+    const isValid = verifyPayUHash(params);
+    const frontend = process.env.FRONTEND_URL || 'http://localhost:3000';
+
+    if (!isValid || params.status !== 'success') {
+        return res.redirect(302, `${frontend}/payment-failure`);
+    }
+
+    const { token } = issuePaymentToken(params.txnid);
+    return res.redirect(302, `${frontend}/payment-success?txnid=${encodeURIComponent(params.txnid)}&token=${encodeURIComponent(token)}`);
+});
+
+app.post('/api/payu/failure', (req, res) => {
+    const frontend = process.env.FRONTEND_URL || 'http://localhost:3000';
+    return res.redirect(302, `${frontend}/payment-failure`);
 });
 
 // ─── /api/payu/verify ────────────────────────────────────────────────────────
@@ -384,7 +524,8 @@ app.post('/api/payu/verify', (req, res) => {
         return res.status(200).json({ verified: false, status: params.status });
     }
 
-    res.json({ verified: true, status: 'success', txnid: params.txnid });
+    const { token } = issuePaymentToken(params.txnid);
+    res.json({ verified: true, status: 'success', txnid: params.txnid, token, expires_in_sec: Math.floor(PAYMENT_TOKEN_TTL_MS / 1000) });
 });
 
 // ─── /api/leads ─────────────────────────────────────────────────────────────
