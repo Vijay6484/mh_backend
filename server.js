@@ -19,6 +19,71 @@ const INDEX_DIR = process.env.INDEX_DIR
     ? path.resolve(process.env.INDEX_DIR)
     : path.join(__dirname, 'indexed_data');
 
+// locations_index.json: built by `node tools/build_locations_index.js` from locations.json
+const LOCATIONS_INDEX_PATH = path.join(__dirname, 'locations_index.json');
+let locationsIndexCache = null;
+
+function loadLocationsIndex() {
+    if (locationsIndexCache) return locationsIndexCache;
+    if (!fs.existsSync(LOCATIONS_INDEX_PATH)) {
+        locationsIndexCache = null;
+        return null;
+    }
+    try {
+        const data = JSON.parse(fs.readFileSync(LOCATIONS_INDEX_PATH, 'utf8'));
+        locationsIndexCache = data;
+        return data;
+    } catch (e) {
+        console.error('[locations] Failed to read locations_index.json', e && e.message);
+        locationsIndexCache = null;
+        return null;
+    }
+}
+
+/**
+ * Resolve numeric ids (d, t, v) to on-disk Marathi folder names.
+ * Ids are stable per `locations_index.json` build order.
+ */
+function resolveMrFromIds(dStr, tStr, vStr) {
+    const idx = loadLocationsIndex();
+    if (!idx || !Array.isArray(idx.districts)) return null;
+    const d = parseInt(String(dStr), 10);
+    const t = parseInt(String(tStr), 10);
+    const v = parseInt(String(vStr), 10);
+    if (Number.isNaN(d) || Number.isNaN(t) || Number.isNaN(v)) return null;
+    const dist = idx.districts.find(x => x.id === d);
+    if (!dist) return null;
+    const tal = (dist.talukas || []).find(x => x.id === t);
+    if (!tal) return null;
+    const vill = (tal.villages || []).find(x => x.id === v);
+    if (!vill) return null;
+    return { district: dist.mr, taluka: tal.mr, village: vill.mr };
+}
+
+function resolveMrFromIdsFixed(d, t, v) {
+    const o = resolveMrFromIds(d, t, v);
+    if (!o || !o.district || !o.taluka || !o.village) return null;
+    return o;
+}
+
+/**
+ * Get Marathi { district, taluka, village } from query/body: prefer ids (d,t,v) or legacy strings.
+ */
+function getMrLocationFromParams(params) {
+    const d = params.d ?? params.districtId;
+    const t = params.t ?? params.talukaId;
+    const v = params.v ?? params.villageId;
+    if (d != null && d !== '' && t != null && t !== '' && v != null && v !== '') {
+        const o = resolveMrFromIdsFixed(d, t, v);
+        if (o) return o;
+    }
+    const { district, taluka, village } = params;
+    if (district && taluka && village) {
+        return { district: String(district), taluka: String(taluka), village: String(village) };
+    }
+    return null;
+}
+
 // Short-lived tokens issued after successful PayU verification.
 // Stored in-memory (process-local). If the server restarts, tokens are cleared.
 const PAYMENT_TOKENS = new Map(); // token -> { txnid, exp }
@@ -202,18 +267,37 @@ async function fetchPdfWithProxy(url, maxRetries = 12) {
 }
 
 // ─── /api/locations ───────────────────────────────────────────────────────────
+// Default: indexed list with ids + mr + en (English transliteration for UI).
+// ?legacy=1 returns raw locations.json (nested object, Marathi only) for old clients.
 app.get('/api/locations', (req, res) => {
-    const locationsPath = path.join(__dirname, 'locations.json');
-    if (!fs.existsSync(locationsPath)) return res.status(404).json({ error: 'Locations file not found' });
-    try { res.json(JSON.parse(fs.readFileSync(locationsPath, 'utf8'))); }
-    catch (e) { res.status(500).json({ error: 'Failed to read locations' }); }
+    if (String(req.query.legacy || '') === '1') {
+        const locationsPath = path.join(__dirname, 'locations.json');
+        if (!fs.existsSync(locationsPath)) return res.status(404).json({ error: 'Locations file not found' });
+        try { res.json(JSON.parse(fs.readFileSync(locationsPath, 'utf8'))); }
+        catch (e) { res.status(500).json({ error: 'Failed to read locations' }); }
+        return;
+    }
+    const idx = loadLocationsIndex();
+    if (!idx) {
+        return res.status(500).json({
+            error: 'Locations index not found. Run: node tools/build_locations_index.js',
+            details: { path: LOCATIONS_INDEX_PATH }
+        });
+    }
+    res.json(idx);
 });
 
 // ─── /api/search ──────────────────────────────────────────────────────────────
 app.get('/api/search', (req, res) => {
-    const { district, taluka, village, query } = req.query;
-    if (!district || !taluka || !village || !query)
-        return res.status(400).json({ error: 'Missing required parameters' });
+    const { query } = req.query;
+    const loc = getMrLocationFromParams(req.query);
+    if (!loc) {
+        return res.status(400).json({
+            error: 'Missing location parameters. Send either d, t, v (numeric ids) or district, taluka, village (Marathi).'
+        });
+    }
+    const { district, taluka, village } = loc;
+    if (!query) return res.status(400).json({ error: 'Missing required parameters' });
     // Accept common user inputs like "74," or "74/1" and extract the leading number.
     const queryMatch = String(query).trim().match(/\d+/);
     if (!queryMatch)
@@ -340,20 +424,29 @@ app.get('/api/search', (req, res) => {
 });
 
 // ─── /api/search/full-by-keys ─────────────────────────────────────────────────
-// POST { token, district, taluka, village, query, keys: [] }
+// POST { token, d, t, v, query, keys } OR { token, district, taluka, village, query, keys }
 // Returns full records matching those SHA keys (for post-payment PDF generation).
 app.post('/api/search/full-by-keys', (req, res) => {
-    const { token, district, taluka, village, query, keys } = req.body || {};
+    const body = req.body || {};
+    const { token, query, keys } = body;
 
     if (!token) return res.status(401).json({ error: 'Missing token' });
-    const t = PAYMENT_TOKENS.get(token);
-    if (!t) return res.status(401).json({ error: 'Invalid token' });
-    if (Date.now() > t.exp) {
+    const payEntry = PAYMENT_TOKENS.get(token);
+    if (!payEntry) return res.status(401).json({ error: 'Invalid token' });
+    if (Date.now() > payEntry.exp) {
         PAYMENT_TOKENS.delete(token);
         return res.status(401).json({ error: 'Token expired' });
     }
 
-    if (!district || !taluka || !village || !query) {
+    const loc = getMrLocationFromParams(body);
+    if (!loc) {
+        return res.status(400).json({
+            error: 'Missing location parameters. Send either d, t, v (numeric ids) or district, taluka, village (Marathi).'
+        });
+    }
+    const { district, taluka, village } = loc;
+
+    if (!query) {
         return res.status(400).json({ error: 'Missing required parameters' });
     }
     if (!Array.isArray(keys) || keys.length === 0) {
