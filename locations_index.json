@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generated": "2026-04-23T13:57:39.559Z",
+  "generated": "2026-04-23T14:20:01.225Z",
   "districts": [
     {
       "id": 1,
@@ -11018,8 +11018,8 @@
             },
             {
               "id": 28,
-              "mr": "किवळे (ंमाळवाडी )",
-              "en": "Kiwale (Nmalwadi )"
+              "mr": "किवळे ंमाळवाडी",
+              "en": "Kiwale Malwadi"
             },
             {
               "id": 29,

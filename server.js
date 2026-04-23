@@ -100,7 +100,12 @@ function normalizeFsKey(s) {
     // Make user input and on-disk names comparable across platforms.
     // - trim to avoid accidental spaces
     // - NFC to reduce Unicode normalization mismatches (common with Indic scripts)
-    return String(s ?? '').trim().normalize('NFC');
+    return String(s ?? '')
+        .trim()
+        .normalize('NFC')
+        .replace(/[()]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
 }
 
 function resolveDirEntry(parentDir, requestedName) {

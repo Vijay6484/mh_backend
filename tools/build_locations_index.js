@@ -51,6 +51,10 @@ const dict = {
     "कात्रज": "Katraj", "कोंढवा": "Kondhwa", "येवलेवाडी": "Yewalewadi", "पिसोळी": "Pisoli", "उंड्री": "Undri",
     "हांडेवाडी": "Handewadi", "औताडे": "Autade", "होळकरवाडी": "Holkarwadi", "वडकी": "Wadaki", "फुरसुंगी": "Fursungi",
     "मांजरी": "Manjari", "शेवाळवाडी": "Shewalwadi", "कदमवाकवस्ती": "Kadamwakwasti", "लोणी": "Loni", "काळभोर": "Kalbhor"
+    ,
+    // Known village spellings (override romanization quirks)
+    "किवळे": "Kiwale",
+    "माळवाडी": "Malwadi"
 };
 
 function toEnglishLabel(mr) {
@@ -69,6 +73,9 @@ function toEnglishLabel(mr) {
         if (w === "Budruk" || w === "Khurd") return w; // already replaced
         
         let mod = w;
+        // Some data contains a leading anusvara as a separate character (e.g. "ंमाळवाडी").
+        // Strip it so transliteration is stable.
+        mod = mod.replace(/^ं+/, '');
         let suffix = "";
         
         if (mod.endsWith("गांव") || mod.endsWith("गाव")) { mod = mod.replace(/गां?व$/, ""); suffix = "gaon"; }
