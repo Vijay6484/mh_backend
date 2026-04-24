@@ -13,6 +13,7 @@ function getSmtpConfigFromEnv() {
         pass: process.env.SMTP_PASS || '',
         from: process.env.SMTP_FROM || '',
         replyTo: process.env.SMTP_REPLY_TO || '',
+        cc: String(process.env.SMTP_CC || '').trim(),
         connectionTimeout: Number(process.env.SMTP_CONNECTION_TIMEOUT_MS || 15000),
     };
 }
@@ -49,6 +50,7 @@ async function sendReportEmail({ to, pdfBuffer, filename, ctx }) {
     await tx.transport.sendMail({
         from: tx.cfg.from,
         to,
+        cc: tx.cfg.cc ? tx.cfg.cc : undefined,
         replyTo: tx.cfg.replyTo || undefined,
         subject: `Mahasuchi Property Search Report - ${ctx.query}`,
         text: [
