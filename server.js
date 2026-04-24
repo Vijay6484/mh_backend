@@ -8,6 +8,10 @@ const { PDFDocument } = require('pdf-lib');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const mongoose = require('mongoose');
 const axios = require('axios');
+const reportData = require('./services/reportData');
+const { generatePropertyReportPdf } = require('./services/reportRenderer');
+const { getSmtpConfigFromEnv, validateSmtpConfig, sendReportEmail } = require('./services/mailer');
+const { forEachRecordInDataJson } = require('./services/streamDataJson');
 
 const app = express();
 app.use(cors({ origin: '*' }));
@@ -150,10 +154,118 @@ const LeadSchema = new mongoose.Schema({
     query: String,
     status: { type: String, enum: ['pending', 'paid', 'failed'], default: 'pending' },
     txnid: { type: String, unique: true },
+    reportEmailSentAt: { type: Date, default: null },
+    reportEmailStatus: { type: String, enum: ['pending', 'sent', 'failed'], default: 'pending' },
+    reportEmailError: { type: String, default: '' },
     createdAt: { type: Date, default: Date.now }
 });
 
 const Lead = mongoose.model('Lead', LeadSchema);
+
+// ─── SMTP config visibility ────────────────────────────────────────────────────
+const smtpCfg = getSmtpConfigFromEnv();
+const smtpValidation = validateSmtpConfig(smtpCfg);
+if (!smtpValidation.ok) {
+    console.warn(`[email] SMTP disabled. Missing vars: ${smtpValidation.missing.join(', ')}`);
+} else {
+    console.log(`[email] SMTP configured (${smtpCfg.host}:${smtpCfg.port}, secure=${smtpCfg.secure})`);
+}
+
+async function getFullRecordsByKeys({ district, taluka, village, query, keys }) {
+    const loaded = await reportData.loadRecordsByContext({
+        indexDir: INDEX_DIR, district, taluka, village, query
+    });
+    const keySet = new Set((keys || []).filter(Boolean));
+    const filtered = loaded.matched.filter(r => keySet.has(r.key));
+    const deduped = reportData.dedupeByKey(filtered);
+    return { queryNumber: loaded.queryNumber, records: deduped };
+}
+
+async function generatePdfForContext({ district, taluka, village, query, records }) {
+    const deduped = reportData.dedupeByKey(records || []);
+    if (!deduped.length) {
+        throw new Error('No records available for report generation');
+    }
+    const queryMatch = String(query).trim().match(/\d+/);
+    const queryNumber = queryMatch ? queryMatch[0] : String(query);
+    const pdf = await generatePropertyReportPdf({
+        records: deduped,
+        ctx: { district, taluka, village, query: queryNumber },
+        assetsDir: path.join(__dirname, 'assets'),
+    });
+    const filename = `Mahasuchi_Report_${queryNumber}.pdf`;
+    return { pdf, filename, queryNumber, deduped };
+}
+
+async function tryAutoEmailReport(txnid) {
+    try {
+        const lead = await Lead.findOne({ txnid }).lean();
+        if (!lead) return { sent: false, skipped: true, reason: 'Lead not found' };
+        if (lead.reportEmailSentAt || lead.reportEmailStatus === 'sent') {
+            return { sent: false, skipped: true, reason: 'Already emailed' };
+        }
+        if (!lead.email) {
+            await Lead.findOneAndUpdate({ txnid }, {
+                reportEmailStatus: 'failed',
+                reportEmailError: 'Lead email missing'
+            }).exec();
+            return { sent: false, skipped: true, reason: 'Lead email missing' };
+        }
+
+        const loaded = await reportData.loadRecordsByContext({
+            indexDir: INDEX_DIR,
+            district: lead.district,
+            taluka: lead.taluka,
+            village: lead.village,
+            query: lead.query,
+        });
+        const deduped = reportData.dedupeByKey(loaded.matched);
+        if (!deduped.length) {
+            await Lead.findOneAndUpdate({ txnid }, {
+                reportEmailStatus: 'failed',
+                reportEmailError: 'No records found for paid search context'
+            }).exec();
+            return { sent: false, skipped: true, reason: 'No matching records' };
+        }
+
+        const { pdf, filename } = await generatePdfForContext({
+            district: lead.district,
+            taluka: lead.taluka,
+            village: lead.village,
+            query: lead.query,
+            records: deduped,
+        });
+
+        const emailRes = await sendReportEmail({
+            to: lead.email,
+            pdfBuffer: pdf,
+            filename,
+            ctx: { district: lead.district, taluka: lead.taluka, village: lead.village, query: lead.query }
+        });
+
+        if (emailRes.sent) {
+            await Lead.findOneAndUpdate({ txnid }, {
+                reportEmailSentAt: new Date(),
+                reportEmailStatus: 'sent',
+                reportEmailError: ''
+            }).exec();
+            return { sent: true };
+        }
+
+        await Lead.findOneAndUpdate({ txnid }, {
+            reportEmailStatus: 'failed',
+            reportEmailError: emailRes.reason || 'SMTP not configured'
+        }).exec();
+        return { sent: false, skipped: true, reason: emailRes.reason || 'SMTP disabled' };
+    } catch (err) {
+        console.error('[email] Auto report email failed', txnid, err && err.message);
+        await Lead.findOneAndUpdate({ txnid }, {
+            reportEmailStatus: 'failed',
+            reportEmailError: err && err.message ? String(err.message).slice(0, 300) : 'Unknown email error'
+        }).exec().catch(() => {});
+        return { sent: false, skipped: true, reason: 'Exception' };
+    }
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 const DAILY_LIMIT_STRINGS = [
@@ -293,7 +405,7 @@ app.get('/api/locations', (req, res) => {
 });
 
 // ─── /api/search ──────────────────────────────────────────────────────────────
-app.get('/api/search', (req, res) => {
+app.get('/api/search', async (req, res) => {
     const { query } = req.query;
     const loc = getMrLocationFromParams(req.query);
     if (!loc) {
@@ -342,17 +454,15 @@ app.get('/api/search', (req, res) => {
     }
 
     try {
-        const raw = fs.readFileSync(filePath, 'utf8');
-        const records = JSON.parse(raw);
         const matched = [];
-        for (const record of records) {
+        await forEachRecordInDataJson(filePath, (record) => {
             if (record.property_numbers && Array.isArray(record.property_numbers)) {
                 for (const prop of record.property_numbers) {
                     const baseNumber = String(prop.value).split(/[\/\-]/)[0].trim();
                     if (baseNumber === String(queryNumber)) { matched.push(record); break; }
                 }
             }
-        }
+        });
 
         // Dedupe key is generated from the block of fields between `document_number`
         // and `pdf_link` (both inclusive), so records that differ only in fields
@@ -416,13 +526,19 @@ app.get('/api/search', (req, res) => {
         }));
         return res.json({ count: results.length, results });
     } catch (error) {
-        console.error('[api/search] Failed reading/parsing data.json', {
+        console.error('[api/search] Failed reading data.json', {
             filePath,
             message: error && error.message
         });
-        // Most common real-world cause here is a partially-written or malformed JSON file.
-        res.status(422).json({
-            error: 'Indexed data file is not valid JSON',
+        const msg = String(error && error.message || '');
+        const isStructure = msg.includes('Top-level object should be an array');
+        const isOom = /allocation|out of memory|string length|Invalid string length/i.test(msg);
+        res.status(isStructure ? 422 : isOom ? 500 : 422).json({
+            error: isStructure
+                ? 'Indexed data file must be a top-level JSON array'
+                : isOom
+                    ? 'Indexed data file is too large to process on this server'
+                    : (msg || 'Failed to read indexed data file'),
             details: { filePath }
         });
     }
@@ -431,7 +547,7 @@ app.get('/api/search', (req, res) => {
 // ─── /api/search/full-by-keys ─────────────────────────────────────────────────
 // POST { token, d, t, v, query, keys } OR { token, district, taluka, village, query, keys }
 // Returns full records matching those SHA keys (for post-payment PDF generation).
-app.post('/api/search/full-by-keys', (req, res) => {
+app.post('/api/search/full-by-keys', async (req, res) => {
     const body = req.body || {};
     const { token, query, keys } = body;
 
@@ -458,98 +574,62 @@ app.post('/api/search/full-by-keys', (req, res) => {
         return res.status(400).json({ error: 'Missing keys' });
     }
 
-    const queryMatch = String(query).trim().match(/\d+/);
-    if (!queryMatch) return res.status(400).json({ error: 'Query must contain a number' });
-    const queryNumber = queryMatch[0];
-
-    if (!fs.existsSync(INDEX_DIR)) {
-        return res.status(500).json({
-            error: 'Index directory not found on server',
-            details: { indexDir: INDEX_DIR }
-        });
-    }
-
-    const resolvedDistrict = resolveDirEntry(INDEX_DIR, district);
-    if (!resolvedDistrict) return res.status(404).json({ error: 'District not found in index' });
-    const districtDir = path.join(INDEX_DIR, resolvedDistrict);
-
-    const resolvedTaluka = resolveDirEntry(districtDir, taluka);
-    if (!resolvedTaluka) return res.status(404).json({ error: 'Taluka not found in index' });
-    const talukaDir = path.join(districtDir, resolvedTaluka);
-
-    const resolvedVillage = resolveDirEntry(talukaDir, village);
-    if (!resolvedVillage) return res.status(404).json({ error: 'Village not found in index' });
-
-    const filePath = path.join(talukaDir, resolvedVillage, 'data.json');
-    if (!fs.existsSync(filePath)) {
-        return res.status(404).json({
-            error: 'Data file not found for the selected location',
-            details: { filePath }
-        });
-    }
-
-    // Fingerprint must match /api/search output
-    const IDENTITY_FIELDS = [
-        'document_number',
-        'document_type',
-        'registration_office',
-        'date',
-        'seller_party',
-        'buyer_party',
-        'text',
-        'property_numbers',
-        'pdf_link',
-    ];
-    const canonicalize = (value) => {
-        if (value === null || value === undefined) return 'null';
-        const typ = typeof value;
-        if (typ === 'string') return JSON.stringify(String(value).trim().normalize('NFC'));
-        if (typ === 'number' || typ === 'boolean') return JSON.stringify(value);
-        if (Array.isArray(value)) {
-            const items = value.map(canonicalize).sort();
-            return `[${items.join(',')}]`;
-        }
-        if (typ === 'object') {
-            const objKeys = Object.keys(value).sort();
-            return `{${objKeys.map(k => `${JSON.stringify(k)}:${canonicalize(value[k])}`).join(',')}}`;
-        }
-        return 'null';
-    };
-    const fingerprint = (record) => {
-        const parts = IDENTITY_FIELDS.map(k => canonicalize(record ? record[k] : undefined));
-        return crypto.createHash('sha256').update(parts.join('|')).digest('base64url');
-    };
-
     try {
-        const raw = fs.readFileSync(filePath, 'utf8');
-        const records = JSON.parse(raw);
-
-        const keySet = new Set(keys.filter(Boolean));
-        const results = [];
-        for (const record of records) {
-            if (record.property_numbers && Array.isArray(record.property_numbers)) {
-                let isMatch = false;
-                for (const prop of record.property_numbers) {
-                    const baseNumber = String(prop.value).split(/[\/\-]/)[0].trim();
-                    if (baseNumber === String(queryNumber)) { isMatch = true; break; }
-                }
-                if (!isMatch) continue;
-            } else {
-                continue;
-            }
-
-            const k = fingerprint(record);
-            if (!keySet.has(k)) continue;
-            results.push({ ...record, key: k });
-        }
-
+        const { records } = await getFullRecordsByKeys({ district, taluka, village, query, keys });
+        const results = reportData.dedupeByKey(records);
         return res.json({ count: results.length, results });
     } catch (error) {
-        console.error('[api/search/full-by-keys] Failed reading/parsing data.json', {
-            filePath,
-            message: error && error.message
+        console.error('[api/search/full-by-keys] failed', error && error.message);
+        return res.status(error.status || 500).json({
+            error: error.message || 'Failed to load full records',
+            details: error.details || undefined
         });
-        return res.status(422).json({ error: 'Indexed data file is not valid JSON', details: { filePath } });
+    }
+});
+
+// ─── /api/report/download ─────────────────────────────────────────────────────
+// POST { token, d, t, v, query, keys } OR { token, district, taluka, village, query, keys }
+// Returns attachment PDF generated server-side (Chromium) with Marathi-accurate rendering.
+app.post('/api/report/download', async (req, res) => {
+    const body = req.body || {};
+    const { token, query, keys } = body;
+
+    if (!token) return res.status(401).json({ error: 'Missing token' });
+    const payEntry = PAYMENT_TOKENS.get(token);
+    if (!payEntry) return res.status(401).json({ error: 'Invalid token' });
+    if (Date.now() > payEntry.exp) {
+        PAYMENT_TOKENS.delete(token);
+        return res.status(401).json({ error: 'Token expired' });
+    }
+
+    const loc = getMrLocationFromParams(body);
+    if (!loc) {
+        return res.status(400).json({
+            error: 'Missing location parameters. Send either d, t, v (numeric ids) or district, taluka, village (Marathi).'
+        });
+    }
+    const { district, taluka, village } = loc;
+    if (!query) return res.status(400).json({ error: 'Missing query' });
+    if (!Array.isArray(keys) || keys.length === 0) return res.status(400).json({ error: 'Missing keys' });
+
+    try {
+        const { records } = await getFullRecordsByKeys({ district, taluka, village, query, keys });
+        if (!records.length) return res.status(404).json({ error: 'No records returned for report generation' });
+
+        const { pdf, filename } = await generatePdfForContext({
+            district, taluka, village, query, records
+        });
+
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename.replace(/[^a-zA-Z0-9_.-]/g, '_')}"`);
+        res.setHeader('Content-Length', pdf.byteLength);
+        return res.send(Buffer.from(pdf));
+    } catch (error) {
+        console.error('[api/report/download] failed', error && error.message);
+        return res.status(error.status || 500).json({
+            error: error.message || 'Failed to generate report PDF',
+            details: error.details || undefined
+        });
     }
 });
 
@@ -604,6 +684,10 @@ app.post('/api/payu/success', (req, res) => {
     }
 
     const { token } = issuePaymentToken(params.txnid);
+    // Fire-and-forget support copy email right after successful payment callback.
+    tryAutoEmailReport(params.txnid).then((r) => {
+        if (r && r.sent) console.log(`[email] Report emailed for txnid ${params.txnid}`);
+    }).catch(() => {});
     return res.redirect(302, `${frontend}/payment-success?txnid=${encodeURIComponent(params.txnid)}&token=${encodeURIComponent(token)}`);
 });
 
@@ -627,6 +711,10 @@ app.post('/api/payu/verify', (req, res) => {
     }
 
     const { token } = issuePaymentToken(params.txnid);
+    // For gateway flows that hit verify route, also trigger auto-email.
+    tryAutoEmailReport(params.txnid).then((r) => {
+        if (r && r.sent) console.log(`[email] Report emailed for txnid ${params.txnid}`);
+    }).catch(() => {});
     res.json({ verified: true, status: 'success', txnid: params.txnid, token, expires_in_sec: Math.floor(PAYMENT_TOKEN_TTL_MS / 1000) });
 });
 
