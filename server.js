@@ -12,6 +12,18 @@ const reportData = require('./services/reportData');
 const { generatePropertyReportPdf } = require('./services/reportRenderer');
 const { getSmtpConfigFromEnv, validateSmtpConfig, sendReportEmail } = require('./services/mailer');
 const { forEachRecordInDataJson } = require('./services/streamDataJson');
+const {
+    isAdminEnvConfigured,
+    getClientId,
+    checkAdminLoginWindow,
+    recordAdminLoginFailure,
+    clearAdminLoginWindow,
+    verifyPassword,
+    signAdminToken,
+    requireAdminAuth,
+    safeEqualStr,
+    getJwtExpires,
+} = require('./services/adminAuth');
 
 const app = express();
 app.use(cors({ origin: '*' }));
@@ -169,6 +181,12 @@ if (!smtpValidation.ok) {
     console.warn(`[email] SMTP disabled. Missing vars: ${smtpValidation.missing.join(', ')}`);
 } else {
     console.log(`[email] SMTP configured (${smtpCfg.host}:${smtpCfg.port}, secure=${smtpCfg.secure})`);
+}
+
+if (isAdminEnvConfigured()) {
+    console.log('[admin] /api/admin/* enabled (JWT login).');
+} else {
+    console.warn('[admin] /api/admin/* disabled. Set ADMIN_USER, ADMIN_PASS_HASH, ADMIN_JWT_SECRET.');
 }
 
 async function getFullRecordsByKeys({ district, taluka, village, query, keys }) {
@@ -404,53 +422,47 @@ app.get('/api/locations', (req, res) => {
     res.json(idx);
 });
 
-// ─── /api/search ──────────────────────────────────────────────────────────────
-app.get('/api/search', async (req, res) => {
-    const { query } = req.query;
-    const loc = getMrLocationFromParams(req.query);
-    if (!loc) {
-        return res.status(400).json({
-            error: 'Missing location parameters. Send either d, t, v (numeric ids) or district, taluka, village (Marathi).'
-        });
-    }
+/**
+ * @param {{ district: string, taluka: string, village: string }} loc
+ * @param {string} query
+ * @returns {Promise<
+ *   { ok: true, queryNumber: string, filePath: string, matched: any[] }
+ *   | { ok: false, status: number, error: string, details?: any, filePath?: string }
+ * >}
+ */
+async function searchPropertyIndex(loc, query) {
     const { district, taluka, village } = loc;
-    if (!query) return res.status(400).json({ error: 'Missing required parameters' });
-    // Accept common user inputs like "74," or "74/1" and extract the leading number.
+    if (!query) {
+        return { ok: false, status: 400, error: 'Missing required parameters' };
+    }
     const queryMatch = String(query).trim().match(/\d+/);
-    if (!queryMatch)
-        return res.status(400).json({ error: 'Query must contain a number' });
+    if (!queryMatch) {
+        return { ok: false, status: 400, error: 'Query must contain a number' };
+    }
     const queryNumber = queryMatch[0];
 
     if (!fs.existsSync(INDEX_DIR)) {
-        return res.status(500).json({
-            error: 'Index directory not found on server',
-            details: { indexDir: INDEX_DIR }
-        });
+        return { ok: false, status: 500, error: 'Index directory not found on server', details: { indexDir: INDEX_DIR } };
     }
 
     const resolvedDistrict = resolveDirEntry(INDEX_DIR, district);
     if (!resolvedDistrict) {
-        return res.status(404).json({ error: 'District not found in index' });
+        return { ok: false, status: 404, error: 'District not found in index' };
     }
-
     const districtDir = path.join(INDEX_DIR, resolvedDistrict);
     const resolvedTaluka = resolveDirEntry(districtDir, taluka);
     if (!resolvedTaluka) {
-        return res.status(404).json({ error: 'Taluka not found in index' });
+        return { ok: false, status: 404, error: 'Taluka not found in index' };
     }
-
     const talukaDir = path.join(districtDir, resolvedTaluka);
     const resolvedVillage = resolveDirEntry(talukaDir, village);
     if (!resolvedVillage) {
-        return res.status(404).json({ error: 'Village not found in index' });
+        return { ok: false, status: 404, error: 'Village not found in index' };
     }
 
     const filePath = path.join(talukaDir, resolvedVillage, 'data.json');
     if (!fs.existsSync(filePath)) {
-        return res.status(404).json({
-            error: 'Data file not found for the selected location',
-            details: { filePath }
-        });
+        return { ok: false, status: 404, error: 'Data file not found for the selected location', details: { filePath } };
     }
 
     try {
@@ -470,48 +482,64 @@ app.get('/api/search', async (req, res) => {
                 }
             }
         });
-
-        // Duplicate identity rows in data.json (same document_number..pdf_link block) are
-        // already collapsed by SHA key during streaming, same as the paid/PDF path.
-
-        // SECURITY: This endpoint is public. Do not expose full indexed records here.
-        // Default response only returns the document type needed for the blurred UI.
-        //
-        // If you need full records (e.g. post-payment), call this endpoint with:
-        // - Header:  x-full-search-key: <SEARCH_FULL_API_KEY>
-        // - Query:   full=1
-        const wantsFull = String(req.query.full || '').toLowerCase() === '1';
-        const providedKey = req.get('x-full-search-key') || '';
-        const serverKey = process.env.SEARCH_FULL_API_KEY || '';
-        const allowFull = Boolean(serverKey) && wantsFull && providedKey === serverKey;
-
-        if (allowFull) {
-            const results = matched.map((r) => ({ ...r, key: reportData.fingerprint(r) }));
-            return res.json({ count: results.length, results });
-        }
-
-        const results = matched.map((r) => ({
-            document_type: r.document_type || 'Unknown',
-            key: reportData.fingerprint(r)
-        }));
-        return res.json({ count: results.length, results });
+        return { ok: true, queryNumber, filePath, matched };
     } catch (error) {
-        console.error('[api/search] Failed reading data.json', {
-            filePath,
-            message: error && error.message
-        });
         const msg = String(error && error.message || '');
         const isStructure = msg.includes('Top-level object should be an array');
         const isOom = /allocation|out of memory|string length|Invalid string length/i.test(msg);
-        res.status(isStructure ? 422 : isOom ? 500 : 422).json({
+        return {
+            ok: false,
+            status: isStructure ? 422 : isOom ? 500 : 422,
             error: isStructure
                 ? 'Indexed data file must be a top-level JSON array'
                 : isOom
                     ? 'Indexed data file is too large to process on this server'
                     : (msg || 'Failed to read indexed data file'),
             details: { filePath }
+        };
+    }
+}
+
+// ─── /api/search ──────────────────────────────────────────────────────────────
+app.get('/api/search', async (req, res) => {
+    const { query } = req.query;
+    const loc = getMrLocationFromParams(req.query);
+    if (!loc) {
+        return res.status(400).json({
+            error: 'Missing location parameters. Send either d, t, v (numeric ids) or district, taluka, village (Marathi).'
         });
     }
+
+    const r = await searchPropertyIndex(loc, query);
+    if (!r.ok) {
+        if (r.filePath) {
+            console.error('[api/search] Failed reading data.json', { filePath: r.filePath, error: r.error });
+        }
+        return res.status(r.status).json({ error: r.error, details: r.details || undefined });
+    }
+    const { queryNumber, filePath, matched } = r;
+
+    // Duplicate identity rows in data.json (same document_number..pdf_link block) are
+    // already collapsed by SHA key during streaming, same as the paid/PDF path.
+
+    // SECURITY: This endpoint is public. Do not expose full indexed records here.
+    // If you need full records (e.g. post-payment), use admin panel or
+    // x-full-search-key with full=1.
+    const wantsFull = String(req.query.full || '').toLowerCase() === '1';
+    const providedKey = req.get('x-full-search-key') || '';
+    const serverKey = process.env.SEARCH_FULL_API_KEY || '';
+    const allowFull = Boolean(serverKey) && wantsFull && providedKey === serverKey;
+
+    if (allowFull) {
+        const results = matched.map((row) => ({ ...row, key: reportData.fingerprint(row) }));
+        return res.json({ count: results.length, results, queryNumber });
+    }
+
+    const results = matched.map((row) => ({
+        document_type: row.document_type || 'Unknown',
+        key: reportData.fingerprint(row)
+    }));
+    return res.json({ count: results.length, results, queryNumber });
 });
 
 // ─── /api/search/full-by-keys ─────────────────────────────────────────────────
@@ -711,6 +739,129 @@ app.post('/api/leads', async (req, res) => {
         // If txnid duplicate (user retrying), just return success
         if (err.code === 11000) return res.json({ success: true });
         res.status(500).json({ error: 'Failed to save lead' });
+    }
+});
+
+// ─── /api/admin/* (JWT + bcrypt; configure ADMIN_USER, ADMIN_PASS_HASH, ADMIN_JWT_SECRET) ─
+// Generate password hash:  node tools/hash_admin_password.js "YourPassword"
+app.post('/api/admin/login', async (req, res) => {
+    if (!isAdminEnvConfigured()) {
+        return res.status(503).json({ error: 'Admin login is not enabled (missing env config).' });
+    }
+    const clientId = getClientId(req);
+    const windowCheck = checkAdminLoginWindow(clientId);
+    if (!windowCheck.ok) {
+        return res.status(429).json({
+            error: 'Too many failed attempts. Try again later.',
+            retryAfterSec: windowCheck.retryAfterSec
+        });
+    }
+    const { username, password } = req.body || {};
+    if (!username || !password) {
+        recordAdminLoginFailure(clientId);
+        return res.status(400).json({ error: 'Missing username or password' });
+    }
+    if (!safeEqualStr(username, process.env.ADMIN_USER || '')) {
+        recordAdminLoginFailure(clientId);
+        return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    let passOk = false;
+    try {
+        passOk = await verifyPassword(String(password), process.env.ADMIN_PASS_HASH);
+    } catch (e) {
+        console.error('[api/admin/login] password check error', e && e.message);
+        return res.status(500).json({ error: 'Server misconfiguration' });
+    }
+    if (!passOk) {
+        recordAdminLoginFailure(clientId);
+        return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    clearAdminLoginWindow(clientId);
+    const token = signAdminToken();
+    return res.json({ token, expires: getJwtExpires() });
+});
+
+app.get('/api/admin/stats', requireAdminAuth, async (req, res) => {
+    try {
+        const [purchased, totalLeads, pending, failed] = await Promise.all([
+            Lead.countDocuments({ status: 'paid' }),
+            Lead.countDocuments({}),
+            Lead.countDocuments({ status: 'pending' }),
+            Lead.countDocuments({ status: 'failed' }),
+        ]);
+        return res.json({ purchased, totalLeads, pending, failed });
+    } catch (err) {
+        console.error('[api/admin/stats]', err);
+        return res.status(500).json({ error: 'Failed to load stats' });
+    }
+});
+
+app.get('/api/admin/leads', requireAdminAuth, async (req, res) => {
+    const limit = Math.min(500, Math.max(1, parseInt(String(req.query.limit || '200'), 10) || 200));
+    try {
+        const leads = await Lead.find({})
+            .sort({ createdAt: -1 })
+            .limit(limit)
+            .lean();
+        return res.json({ count: leads.length, leads });
+    } catch (err) {
+        console.error('[api/admin/leads]', err);
+        return res.status(500).json({ error: 'Failed to load leads' });
+    }
+});
+
+app.get('/api/admin/search', requireAdminAuth, async (req, res) => {
+    const { query } = req.query;
+    const loc = getMrLocationFromParams(req.query);
+    if (!loc) {
+        return res.status(400).json({
+            error: 'Missing location. Send d, t, v (ids) or district, taluka, village (Marathi).'
+        });
+    }
+    const r = await searchPropertyIndex(loc, query);
+    if (!r.ok) {
+        if (r.filePath) {
+            console.error('[api/admin/search] index read error', { filePath: r.filePath, error: r.error });
+        }
+        return res.status(r.status).json({ error: r.error, details: r.details || undefined });
+    }
+    const results = r.matched.map((row) => ({ ...row, key: reportData.fingerprint(row) }));
+    return res.json({ count: results.length, results, queryNumber: r.queryNumber });
+});
+
+// Same PDF as paid flow; requires admin JWT (no payment).
+app.post('/api/admin/report', requireAdminAuth, async (req, res) => {
+    const body = req.body || {};
+    const { query, keys } = body;
+    const loc = getMrLocationFromParams(body);
+    if (!loc) {
+        return res.status(400).json({
+            error: 'Missing location. Send d, t, v or district, taluka, village.'
+        });
+    }
+    if (!query) return res.status(400).json({ error: 'Missing query' });
+    if (!Array.isArray(keys) || keys.length === 0) {
+        return res.status(400).json({ error: 'Missing keys' });
+    }
+    const { district, taluka, village } = loc;
+    try {
+        const { records } = await getFullRecordsByKeys({ district, taluka, village, query, keys });
+        if (!records.length) {
+            return res.status(404).json({ error: 'No records returned for report generation' });
+        }
+        const { pdf, filename } = await generatePdfForContext({
+            district, taluka, village, query, records
+        });
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename.replace(/[^a-zA-Z0-9_.-]/g, '_')}"`);
+        res.setHeader('Content-Length', pdf.byteLength);
+        return res.send(Buffer.from(pdf));
+    } catch (error) {
+        console.error('[api/admin/report]', error && error.message);
+        return res.status(error.status || 500).json({
+            error: error.message || 'Failed to generate report PDF',
+            details: error.details || undefined
+        });
     }
 });
 

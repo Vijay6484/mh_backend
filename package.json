@@ -7,7 +7,8 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node server.js",
     "gen:pdf": "node tools/generate_report_pdf.js",
-    "build:locations": "node tools/build_locations_index.js"
+    "build:locations": "node tools/build_locations_index.js",
+    "hash:admin": "node tools/hash_admin_password.js"
   },
   "keywords": [],
   "author": "",
@@ -17,10 +18,12 @@
     "@indic-transliteration/sanscript": "^1.3.3",
     "axios": "^1.15.1",
     "axios-retry": "^4.5.0",
+    "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "https-proxy-agent": "^9.0.0",
+    "jsonwebtoken": "^9.0.3",
     "jspdf": "^2.5.2",
     "jspdf-autotable": "^3.8.4",
     "mongoose": "^9.5.0",
