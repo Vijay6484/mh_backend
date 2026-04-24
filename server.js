@@ -455,53 +455,24 @@ app.get('/api/search', async (req, res) => {
 
     try {
         const matched = [];
+        const seenKey = new Set();
         await forEachRecordInDataJson(filePath, (record) => {
             if (record.property_numbers && Array.isArray(record.property_numbers)) {
                 for (const prop of record.property_numbers) {
                     const baseNumber = String(prop.value).split(/[\/\-]/)[0].trim();
-                    if (baseNumber === String(queryNumber)) { matched.push(record); break; }
+                    if (baseNumber === String(queryNumber)) {
+                        const key = reportData.fingerprint(record);
+                        if (seenKey.has(key)) return;
+                        seenKey.add(key);
+                        matched.push(record);
+                        return;
+                    }
                 }
             }
         });
 
-        // Dedupe key is generated from the block of fields between `document_number`
-        // and `pdf_link` (both inclusive), so records that differ only in fields
-        // like `doc_id` / `serial_number` / `village` / `year` still collapse into one.
-        //
-        // Strings are normalized (trim + NFC). Objects/arrays are canonicalized
-        // (object keys sorted, array items sorted) so order differences don't change the key.
-        const IDENTITY_FIELDS = [
-            'document_number',
-            'document_type',
-            'registration_office',
-            'date',
-            'seller_party',
-            'buyer_party',
-            'text',
-            'property_numbers',
-            'pdf_link',
-        ];
-
-        const canonicalize = (value) => {
-            if (value === null || value === undefined) return 'null';
-            const t = typeof value;
-            if (t === 'string') return JSON.stringify(String(value).trim().normalize('NFC'));
-            if (t === 'number' || t === 'boolean') return JSON.stringify(value);
-            if (Array.isArray(value)) {
-                const items = value.map(canonicalize).sort();
-                return `[${items.join(',')}]`;
-            }
-            if (t === 'object') {
-                const keys = Object.keys(value).sort();
-                return `{${keys.map(k => `${JSON.stringify(k)}:${canonicalize(value[k])}`).join(',')}}`;
-            }
-            return 'null';
-        };
-
-        const fingerprint = (record) => {
-            const parts = IDENTITY_FIELDS.map(k => canonicalize(record ? record[k] : undefined));
-            return crypto.createHash('sha256').update(parts.join('|')).digest('base64url');
-        };
+        // Duplicate identity rows in data.json (same document_number..pdf_link block) are
+        // already collapsed by SHA key during streaming, same as the paid/PDF path.
 
         // SECURITY: This endpoint is public. Do not expose full indexed records here.
         // Default response only returns the document type needed for the blurred UI.
@@ -515,14 +486,13 @@ app.get('/api/search', async (req, res) => {
         const allowFull = Boolean(serverKey) && wantsFull && providedKey === serverKey;
 
         if (allowFull) {
-            // For internal use you may still want a stable key for each record.
-            const results = matched.map(r => ({ ...r, key: fingerprint(r) }));
+            const results = matched.map((r) => ({ ...r, key: reportData.fingerprint(r) }));
             return res.json({ count: results.length, results });
         }
 
-        const results = matched.map(r => ({
+        const results = matched.map((r) => ({
             document_type: r.document_type || 'Unknown',
-            key: fingerprint(r)
+            key: reportData.fingerprint(r)
         }));
         return res.json({ count: results.length, results });
     } catch (error) {

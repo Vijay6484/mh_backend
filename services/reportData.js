@@ -129,6 +129,7 @@ async function loadRecordsByContext({ indexDir, district, taluka, village, query
     const queryNumber = queryMatch[0];
 
     const matched = [];
+    const seenKey = new Set();
     try {
         await forEachRecordInDataJson(filePath, (record) => {
             if (!Array.isArray(record.property_numbers)) return;
@@ -138,7 +139,10 @@ async function loadRecordsByContext({ indexDir, district, taluka, village, query
                 if (baseNumber === String(queryNumber)) { isMatch = true; break; }
             }
             if (!isMatch) return;
-            matched.push({ ...record, key: fingerprint(record) });
+            const key = fingerprint(record);
+            if (seenKey.has(key)) return;
+            seenKey.add(key);
+            matched.push({ ...record, key });
         });
     } catch (err) {
         const e = new Error(
