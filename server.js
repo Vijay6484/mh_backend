@@ -4,6 +4,7 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
 const { PDFDocument } = require('pdf-lib');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const mongoose = require('mongoose');
@@ -25,15 +26,86 @@ const {
     getJwtExpires,
 } = require('./services/adminAuth');
 
+// ─── Simple In-Memory Cache for Search Results ────────────────────────────────
+const SEARCH_CACHE = new Map();
+const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+function getCacheKey(loc, query) {
+    return `${loc.district}|${loc.taluka}|${loc.village}|${query}`;
+}
+
+function setCachedResults(loc, query, data) {
+    const key = getCacheKey(loc, query);
+    SEARCH_CACHE.set(key, { data, exp: Date.now() + CACHE_TTL_MS });
+}
+
+function getCachedResults(loc, query) {
+    const key = getCacheKey(loc, query);
+    const entry = SEARCH_CACHE.get(key);
+    if (!entry) return null;
+    if (Date.now() > entry.exp) {
+        SEARCH_CACHE.delete(key);
+        return null;
+    }
+    return entry.data;
+}
+
+// Periodically clean up expired cache entries
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, entry] of SEARCH_CACHE.entries()) {
+        if (now > entry.exp) SEARCH_CACHE.delete(key);
+    }
+}, 5 * 60 * 1000);
+// ──────────────────────────────────────────────────────────────────────────────
+
 const app = express();
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 // PayU posts back as form-urlencoded
 app.use(express.urlencoded({ extended: true }));
 
+// Public config for frontend runtime toggles (no auth).
+app.get('/api/public-config', (req, res) => {
+    const maintenance = parseBoolEnv(process.env.MAINTENANCE_MODE || '0');
+    const liveIn = String(process.env.MAINTENANCE_LIVE_IN || 'one hour').trim() || 'one hour';
+    return res.json({
+        maintenance,
+        maintenance_message: `We’ll be live in ${liveIn}.`,
+        now_iso: new Date().toISOString(),
+    });
+});
+
+// Maintenance gate for API: when enabled, block all API routes except allowlisted ones.
+app.use('/api', (req, res, next) => {
+    const maintenance = parseBoolEnv(process.env.MAINTENANCE_MODE || '0');
+    if (!maintenance) return next();
+
+    const allow = new Set([
+        '/public-config',
+        // Allow PayU callbacks/verification to avoid breaking in-flight payments.
+        '/payu/success',
+        '/payu/failure',
+        '/payu/verify',
+    ]);
+    const pathOnly = String(req.path || '');
+    if (allow.has(pathOnly)) return next();
+
+    return res.status(503).json({
+        error: 'Maintenance mode',
+        message: 'Service temporarily unavailable. Please try again later.',
+    });
+});
+
 const INDEX_DIR = process.env.INDEX_DIR
     ? path.resolve(process.env.INDEX_DIR)
     : path.join(__dirname, 'indexed_data');
+
+// ─── Public runtime config (maintenance switch, etc.) ─────────────────────────
+function parseBoolEnv(v) {
+    const s = String(v ?? '').trim().toLowerCase();
+    return s === '1' || s === 'true' || s === 'yes' || s === 'on';
+}
 
 // locations_index.json: built by `node tools/build_locations_index.js` from locations.json
 const LOCATIONS_INDEX_PATH = path.join(__dirname, 'locations_index.json');
@@ -100,16 +172,61 @@ function getMrLocationFromParams(params) {
     return null;
 }
 
-// Short-lived tokens issued after successful PayU verification.
-// Stored in-memory (process-local). If the server restarts, tokens are cleared.
-const PAYMENT_TOKENS = new Map(); // token -> { txnid, exp }
-const PAYMENT_TOKEN_TTL_MS = 10 * 60 * 1000; // 10 minutes
+// Payment tokens (for paid report download)
+// - New format: JWT (stateless, survives refresh/server restart)
+// - Backward compat: legacy in-memory tokens (older frontend builds)
+const PAYMENT_TOKENS = new Map(); // legacy token -> { txnid, exp }
+const PAYMENT_TOKEN_TTL_MS = 10 * 60 * 1000; // legacy tokens: 10 minutes
+
+const PAYMENT_JWT_SECRET =
+    process.env.PAYMENT_JWT_SECRET ||
+    process.env.ADMIN_JWT_SECRET ||
+    process.env.PAYU_MERCHANT_SALT ||
+    '';
 
 function issuePaymentToken(txnid) {
-    const token = crypto.randomBytes(24).toString('base64url');
-    const exp = Date.now() + PAYMENT_TOKEN_TTL_MS;
-    PAYMENT_TOKENS.set(token, { txnid, exp });
-    return { token, exp };
+    // If secret missing for some reason, fall back to legacy in-memory token.
+    if (!PAYMENT_JWT_SECRET) {
+        const token = crypto.randomBytes(24).toString('base64url');
+        const exp = Date.now() + PAYMENT_TOKEN_TTL_MS;
+        PAYMENT_TOKENS.set(token, { txnid, exp });
+        return { token, exp, legacy: true };
+    }
+
+    // "Forever" token: keep it effectively non-expiring (10 years).
+    const token = jwt.sign(
+        { typ: 'pay', txnid: String(txnid || '') },
+        PAYMENT_JWT_SECRET,
+        { algorithm: 'HS256', expiresIn: '3650d' }
+    );
+    return { token, exp: null, legacy: false };
+}
+
+function verifyPaymentToken(token) {
+    const t = String(token || '').trim();
+    if (!t) return { ok: false, status: 401, error: 'Missing token' };
+
+    // Prefer JWT verification (new format).
+    if (PAYMENT_JWT_SECRET) {
+        try {
+            const payload = jwt.verify(t, PAYMENT_JWT_SECRET, { algorithms: ['HS256'] });
+            if (!payload || payload.typ !== 'pay' || !payload.txnid) {
+                return { ok: false, status: 401, error: 'Invalid token' };
+            }
+            return { ok: true, txnid: String(payload.txnid) };
+        } catch (_) {
+            // fall through to legacy
+        }
+    }
+
+    // Legacy in-memory tokens (old frontend builds).
+    const payEntry = PAYMENT_TOKENS.get(t);
+    if (!payEntry) return { ok: false, status: 401, error: 'Invalid token' };
+    if (Date.now() > payEntry.exp) {
+        PAYMENT_TOKENS.delete(t);
+        return { ok: false, status: 401, error: 'Token expired' };
+    }
+    return { ok: true, txnid: String(payEntry.txnid) };
 }
 
 function normalizeFsKey(s) {
@@ -174,6 +291,45 @@ const LeadSchema = new mongoose.Schema({
 
 const Lead = mongoose.model('Lead', LeadSchema);
 
+// ─── PDF Cache (post-payment) ────────────────────────────────────────────────
+// Speeds up repeated downloads/refreshes by reusing the already-rendered PDF.
+const PDF_CACHE = new Map(); // cacheKey -> { pdf: Buffer, filename: string, exp: number }
+const PDF_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+function getPdfCacheKey({ district, taluka, village, query, keys }) {
+    const keyList = Array.isArray(keys) ? [...keys].filter(Boolean).sort() : [];
+    const payload = JSON.stringify({
+        district: String(district || ''),
+        taluka: String(taluka || ''),
+        village: String(village || ''),
+        query: String(query || ''),
+        keys: keyList,
+    });
+    return crypto.createHash('sha256').update(payload).digest('hex');
+}
+
+function getCachedPdf(cacheKey) {
+    const e = PDF_CACHE.get(cacheKey);
+    if (!e) return null;
+    if (Date.now() > e.exp) {
+        PDF_CACHE.delete(cacheKey);
+        return null;
+    }
+    return e;
+}
+
+function setCachedPdf(cacheKey, { pdf, filename }) {
+    if (!pdf || !Buffer.isBuffer(pdf)) return;
+    PDF_CACHE.set(cacheKey, { pdf, filename: String(filename || 'Mahasuchi_Report.pdf'), exp: Date.now() + PDF_CACHE_TTL_MS });
+}
+
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of PDF_CACHE.entries()) {
+        if (!v || now > v.exp) PDF_CACHE.delete(k);
+    }
+}, 10 * 60 * 1000);
+
 // ─── SMTP config visibility ────────────────────────────────────────────────────
 const smtpCfg = getSmtpConfigFromEnv();
 const smtpValidation = validateSmtpConfig(smtpCfg);
@@ -190,13 +346,26 @@ if (isAdminEnvConfigured()) {
 }
 
 async function getFullRecordsByKeys({ district, taluka, village, query, keys }) {
-    const loaded = await reportData.loadRecordsByContext({
-        indexDir: INDEX_DIR, district, taluka, village, query
-    });
+    const loc = { district, taluka, village };
+    const queryMatch = String(query).trim().match(/\d+/);
+    const queryNumber = queryMatch ? queryMatch[0] : String(query);
+
+    let matched = getCachedResults(loc, queryNumber);
+    let qNum = queryNumber;
+
+    if (!matched) {
+        const r = await searchPropertyIndex(loc, queryNumber);
+        if (!r.ok) {
+            throw new Error(r.error || 'Failed to load records for PDF');
+        }
+        matched = r.matched;
+        qNum = r.queryNumber;
+    }
+
     const keySet = new Set((keys || []).filter(Boolean));
-    const filtered = loaded.matched.filter(r => keySet.has(r.key));
+    const filtered = matched.filter(r => keySet.has(reportData.fingerprint(r)));
     const deduped = reportData.dedupeByKey(filtered);
-    return { queryNumber: loaded.queryNumber, records: deduped };
+    return { queryNumber: qNum, records: deduped };
 }
 
 async function generatePdfForContext({ district, taluka, village, query, records }) {
@@ -230,14 +399,21 @@ async function tryAutoEmailReport(txnid) {
             return { sent: false, skipped: true, reason: 'Lead email missing' };
         }
 
-        const loaded = await reportData.loadRecordsByContext({
-            indexDir: INDEX_DIR,
-            district: lead.district,
-            taluka: lead.taluka,
-            village: lead.village,
-            query: lead.query,
-        });
-        const deduped = reportData.dedupeByKey(loaded.matched);
+        const loaded = getCachedResults({ district: lead.district, taluka: lead.taluka, village: lead.village }, lead.query);
+        let matched = loaded;
+        if (!matched) {
+            const r = await searchPropertyIndex({ district: lead.district, taluka: lead.taluka, village: lead.village }, lead.query);
+            if (!r.ok) {
+                await Lead.findOneAndUpdate({ txnid }, {
+                    reportEmailStatus: 'failed',
+                    reportEmailError: 'Failed to load records for auto-email'
+                }).exec();
+                return { sent: false, skipped: true, reason: 'Failed to load records' };
+            }
+            matched = r.matched;
+        }
+        
+        const deduped = reportData.dedupeByKey(matched);
         if (!deduped.length) {
             await Lead.findOneAndUpdate({ txnid }, {
                 reportEmailStatus: 'failed',
@@ -465,6 +641,11 @@ async function searchPropertyIndex(loc, query) {
         return { ok: false, status: 404, error: 'Data file not found for the selected location', details: { filePath } };
     }
 
+    const cached = getCachedResults(loc, queryNumber);
+    if (cached) {
+        return { ok: true, queryNumber, filePath, matched: cached };
+    }
+
     try {
         const matched = [];
         const seenKey = new Set();
@@ -482,6 +663,7 @@ async function searchPropertyIndex(loc, query) {
                 }
             }
         });
+        setCachedResults(loc, queryNumber, matched);
         return { ok: true, queryNumber, filePath, matched };
     } catch (error) {
         const msg = String(error && error.message || '');
@@ -549,13 +731,8 @@ app.post('/api/search/full-by-keys', async (req, res) => {
     const body = req.body || {};
     const { token, query, keys } = body;
 
-    if (!token) return res.status(401).json({ error: 'Missing token' });
-    const payEntry = PAYMENT_TOKENS.get(token);
-    if (!payEntry) return res.status(401).json({ error: 'Invalid token' });
-    if (Date.now() > payEntry.exp) {
-        PAYMENT_TOKENS.delete(token);
-        return res.status(401).json({ error: 'Token expired' });
-    }
+    const tok = verifyPaymentToken(token);
+    if (!tok.ok) return res.status(tok.status).json({ error: tok.error });
 
     const loc = getMrLocationFromParams(body);
     if (!loc) {
@@ -592,13 +769,8 @@ app.post('/api/report/download', async (req, res) => {
     const body = req.body || {};
     const { token, query, keys } = body;
 
-    if (!token) return res.status(401).json({ error: 'Missing token' });
-    const payEntry = PAYMENT_TOKENS.get(token);
-    if (!payEntry) return res.status(401).json({ error: 'Invalid token' });
-    if (Date.now() > payEntry.exp) {
-        PAYMENT_TOKENS.delete(token);
-        return res.status(401).json({ error: 'Token expired' });
-    }
+    const tok = verifyPaymentToken(token);
+    if (!tok.ok) return res.status(tok.status).json({ error: tok.error });
 
     const loc = getMrLocationFromParams(body);
     if (!loc) {
@@ -611,6 +783,15 @@ app.post('/api/report/download', async (req, res) => {
     if (!Array.isArray(keys) || keys.length === 0) return res.status(400).json({ error: 'Missing keys' });
 
     try {
+        const cacheKey = getPdfCacheKey({ district, taluka, village, query, keys });
+        const cached = getCachedPdf(cacheKey);
+        if (cached) {
+            res.setHeader('Content-Type', 'application/pdf');
+            res.setHeader('Content-Disposition', `attachment; filename="${cached.filename.replace(/[^a-zA-Z0-9_.-]/g, '_')}"`);
+            res.setHeader('Content-Length', cached.pdf.byteLength);
+            return res.send(Buffer.from(cached.pdf));
+        }
+
         const { records } = await getFullRecordsByKeys({ district, taluka, village, query, keys });
         if (!records.length) return res.status(404).json({ error: 'No records returned for report generation' });
 
@@ -618,6 +799,7 @@ app.post('/api/report/download', async (req, res) => {
             district, taluka, village, query, records
         });
 
+        setCachedPdf(cacheKey, { pdf: Buffer.from(pdf), filename });
         res.setHeader('Content-Type', 'application/pdf');
         res.setHeader('Content-Disposition', `attachment; filename="${filename.replace(/[^a-zA-Z0-9_.-]/g, '_')}"`);
         res.setHeader('Content-Length', pdf.byteLength);
@@ -631,11 +813,71 @@ app.post('/api/report/download', async (req, res) => {
     }
 });
 
+// ─── /api/report/email ────────────────────────────────────────────────────────
+// POST { token, to, d,t,v, query, keys } OR { token, to, district,taluka,village, query, keys }
+// Sends the same PDF as download flow, but emails it via SMTP.
+// This path does NOT require MongoDB; it is used as a reliable fallback.
+app.post('/api/report/email', async (req, res) => {
+    const body = req.body || {};
+    const { token, query, keys } = body;
+    const to = String(body.to || '').trim();
+
+    const tok = verifyPaymentToken(token);
+    if (!tok.ok) return res.status(tok.status).json({ sent: false, error: tok.error });
+    if (!to) return res.status(400).json({ sent: false, error: 'Missing recipient email (to)' });
+
+    const loc = getMrLocationFromParams(body);
+    if (!loc) {
+        return res.status(400).json({
+            sent: false,
+            error: 'Missing location parameters. Send either d, t, v (numeric ids) or district, taluka, village (Marathi).'
+        });
+    }
+    const { district, taluka, village } = loc;
+    if (!query) return res.status(400).json({ sent: false, error: 'Missing query' });
+    if (!Array.isArray(keys) || keys.length === 0) return res.status(400).json({ sent: false, error: 'Missing keys' });
+
+    try {
+        const cacheKey = getPdfCacheKey({ district, taluka, village, query, keys });
+        let cached = getCachedPdf(cacheKey);
+
+        let pdfBuf;
+        let filename;
+        if (cached) {
+            pdfBuf = Buffer.from(cached.pdf);
+            filename = cached.filename;
+        } else {
+            const { records } = await getFullRecordsByKeys({ district, taluka, village, query, keys });
+            if (!records.length) return res.status(404).json({ sent: false, error: 'No records returned for report generation' });
+            const g = await generatePdfForContext({ district, taluka, village, query, records });
+            pdfBuf = Buffer.from(g.pdf);
+            filename = g.filename;
+            setCachedPdf(cacheKey, { pdf: pdfBuf, filename });
+        }
+
+        const emailRes = await sendReportEmail({
+            to,
+            pdfBuffer: pdfBuf,
+            filename,
+            ctx: { district, taluka, village, query: String(query) }
+        });
+
+        if (!emailRes.sent) {
+            return res.status(503).json({ sent: false, error: emailRes.reason || 'Email not sent' });
+        }
+
+        return res.json({ sent: true });
+    } catch (err) {
+        console.error('[api/report/email] failed', err && err.message);
+        return res.status(500).json({ sent: false, error: err && err.message ? String(err.message) : 'Failed to send email' });
+    }
+});
+
 // ─── /api/payu/initiate ─────────────────────────────────────────────────────
-// POST { amount, productinfo, firstname, email, phone, query }
+// POST { amount, productinfo, firstname, email, phone, searchQuery, txnid? }
 // Returns: PayU form fields + hash for frontend to submit
 app.post('/api/payu/initiate', (req, res) => {
-    const { productinfo, firstname, email, phone, searchQuery } = req.body;
+    const { productinfo, firstname, email, phone, searchQuery, txnid: txnidFromClient } = req.body;
 
     if (!productinfo || !firstname || !email || !phone) {
         return res.status(400).json({ error: 'Missing payment fields' });
@@ -646,7 +888,13 @@ app.post('/api/payu/initiate', (req, res) => {
     const GST_RATE = 0.18;
     const amtFixed = (REPORT_FEE_INR * (1 + GST_RATE)).toFixed(2);
 
-    const txnid    = `MSC_${Date.now()}_${Math.random().toString(36).substr(2, 6).toUpperCase()}`;
+    // IMPORTANT:
+    // Frontend creates txnid and stores Lead({txnid}) before calling this route.
+    // If we generate a different txnid here, PayU callbacks won't match the Lead, and auto-email will not run.
+    const safeClientTxnid = String(txnidFromClient || '').trim();
+    const txnid = (/^MSC_[0-9]{10,}_[A-Z0-9]{4,10}$/.test(safeClientTxnid) && safeClientTxnid.length <= 80)
+        ? safeClientTxnid
+        : `MSC_${Date.now()}_${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
     const udf1     = searchQuery || '';   // store search query for post-payment use
 
     const hash = generatePayUHash({
@@ -713,7 +961,7 @@ app.post('/api/payu/verify', (req, res) => {
     tryAutoEmailReport(params.txnid).then((r) => {
         if (r && r.sent) console.log(`[email] Report emailed for txnid ${params.txnid}`);
     }).catch(() => {});
-    res.json({ verified: true, status: 'success', txnid: params.txnid, token, expires_in_sec: Math.floor(PAYMENT_TOKEN_TTL_MS / 1000) });
+    res.json({ verified: true, status: 'success', txnid: params.txnid, token, expires_in_sec: 3650 * 24 * 60 * 60 });
 });
 
 // ─── /api/leads ─────────────────────────────────────────────────────────────

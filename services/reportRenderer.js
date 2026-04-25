@@ -232,6 +232,44 @@ function resolveChromePath() {
     return undefined;
 }
 
+let browserInstance = null;
+let browserLaunchPromise = null;
+
+async function getBrowser(chromeExecutablePath) {
+    if (browserInstance && browserInstance.isConnected()) {
+        return browserInstance;
+    }
+    if (browserLaunchPromise) {
+        return browserLaunchPromise;
+    }
+
+    const launchOpts = {
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--font-render-hinting=none'],
+    };
+    const resolvedPath = chromeExecutablePath || resolveChromePath();
+    if (resolvedPath) launchOpts.executablePath = resolvedPath;
+
+    browserLaunchPromise = puppeteer.launch(launchOpts).then(b => {
+        browserInstance = b;
+        browserLaunchPromise = null;
+        
+        // Auto-cleanup if disconnected
+        b.on('disconnected', () => {
+            if (browserInstance === b) {
+                browserInstance = null;
+            }
+        });
+        
+        return b;
+    }).catch(err => {
+        browserLaunchPromise = null;
+        throw err;
+    });
+
+    return browserLaunchPromise;
+}
+
 async function generatePropertyReportPdf({ records, ctx, assetsDir, chromeExecutablePath }) {
     if (!Array.isArray(records) || records.length === 0) {
         throw new Error('Cannot render PDF: records are empty');
@@ -248,17 +286,13 @@ async function generatePropertyReportPdf({ records, ctx, assetsDir, chromeExecut
     const fontDataUrl = fileToDataUrl(fontPath, 'font/ttf');
     const html = renderHtml({ records, ctx, logoDataUrl, fontDataUrl });
 
-    const launchOpts = {
-        headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--font-render-hinting=none'],
-    };
-    const resolvedPath = chromeExecutablePath || resolveChromePath();
-    if (resolvedPath) launchOpts.executablePath = resolvedPath;
-
-    const browser = await puppeteer.launch(launchOpts);
+    const browser = await getBrowser(chromeExecutablePath);
+    let page;
     try {
-        const page = await browser.newPage();
-        await page.setContent(html, { waitUntil: 'networkidle0' });
+        page = await browser.newPage();
+        // We embed assets as data: URLs, so there is no real network work to wait for.
+        // `networkidle0` can add unnecessary delay; `domcontentloaded` is much faster here.
+        await page.setContent(html, { waitUntil: 'domcontentloaded' });
         const pdfBuffer = await page.pdf({
             format: 'A4',
             printBackground: true,
@@ -268,7 +302,7 @@ async function generatePropertyReportPdf({ records, ctx, assetsDir, chromeExecut
         });
         return Buffer.from(pdfBuffer);
     } finally {
-        await browser.close();
+        if (page) await page.close().catch(() => {});
     }
 }
 
