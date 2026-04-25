@@ -10,7 +10,6 @@ const { HttpsProxyAgent } = require('https-proxy-agent');
 const mongoose = require('mongoose');
 const axios = require('axios');
 const reportData = require('./services/reportData');
-const { generatePropertyReportPdf } = require('./services/reportRenderer');
 const { getSmtpConfigFromEnv, validateSmtpConfig, sendReportEmail } = require('./services/mailer');
 const { forEachRecordInDataJson } = require('./services/streamDataJson');
 const {
@@ -26,44 +25,12 @@ const {
     getJwtExpires,
 } = require('./services/adminAuth');
 
-// ─── Simple In-Memory Cache for Search Results ────────────────────────────────
-const SEARCH_CACHE = new Map();
-const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
-
-function getCacheKey(loc, query) {
-    return `${loc.district}|${loc.taluka}|${loc.village}|${query}`;
-}
-
-function setCachedResults(loc, query, data) {
-    const key = getCacheKey(loc, query);
-    SEARCH_CACHE.set(key, { data, exp: Date.now() + CACHE_TTL_MS });
-}
-
-function getCachedResults(loc, query) {
-    const key = getCacheKey(loc, query);
-    const entry = SEARCH_CACHE.get(key);
-    if (!entry) return null;
-    if (Date.now() > entry.exp) {
-        SEARCH_CACHE.delete(key);
-        return null;
-    }
-    return entry.data;
-}
-
-// Periodically clean up expired cache entries
-setInterval(() => {
-    const now = Date.now();
-    for (const [key, entry] of SEARCH_CACHE.entries()) {
-        if (now > entry.exp) SEARCH_CACHE.delete(key);
-    }
-}, 5 * 60 * 1000);
-// ──────────────────────────────────────────────────────────────────────────────
-
 const app = express();
 app.use(cors({ origin: '*' }));
-app.use(express.json());
+// Large payload needed for uploading client-generated PDFs.
+app.use(express.json({ limit: '30mb' }));
 // PayU posts back as form-urlencoded
-app.use(express.urlencoded({ extended: true }));
+app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 
 // Public config for frontend runtime toggles (no auth).
 app.get('/api/public-config', (req, res) => {
@@ -107,8 +74,11 @@ function parseBoolEnv(v) {
     return s === '1' || s === 'true' || s === 'yes' || s === 'on';
 }
 
-// locations_index.json: built by `node tools/build_locations_index.js` from locations.json
-const LOCATIONS_INDEX_PATH = path.join(__dirname, 'locations_index.json');
+// locations_index.json: built by `node tools/build_locations_index.js` from locations.json.
+// Override LOCATIONS_INDEX_PATH in .env if you want a small local testing index.
+const LOCATIONS_INDEX_PATH = process.env.LOCATIONS_INDEX_PATH
+    ? path.resolve(process.env.LOCATIONS_INDEX_PATH)
+    : path.join(__dirname, 'locations_index.json');
 let locationsIndexCache = null;
 
 function loadLocationsIndex() {
@@ -259,10 +229,24 @@ function resolveDirEntry(parentDir, requestedName) {
 }
 
 // ─── PayU Config (from .env) ──────────────────────────────────────────────────
-const PAYU_KEY     = process.env.PAYU_MERCHANT_KEY;
-const PAYU_SALT    = process.env.PAYU_MERCHANT_SALT;
-const PAYU_URL     = process.env.PAYU_BASE_URL || 'https://test.payu.in/_payment';
-const FRONTEND_URL = process.env.FRONTEND_URL  || 'http://localhost:3000';
+// PAYU_MODE=test uses PAYU_TEST_* vars; anything else uses PAYU_* / PAYU_LIVE_*.
+const PAYU_MODE = String(process.env.PAYU_MODE || 'live').trim().toLowerCase();
+const PAYU_IS_TEST = PAYU_MODE === 'test' || PAYU_MODE === 'sandbox';
+const PAYU_KEY = PAYU_IS_TEST
+    ? (process.env.PAYU_TEST_MERCHANT_KEY || process.env.PAYU_MERCHANT_KEY)
+    : (process.env.PAYU_LIVE_MERCHANT_KEY || process.env.PAYU_MERCHANT_KEY);
+const PAYU_SALT = PAYU_IS_TEST
+    ? (process.env.PAYU_TEST_MERCHANT_SALT || process.env.PAYU_MERCHANT_SALT)
+    : (process.env.PAYU_LIVE_MERCHANT_SALT || process.env.PAYU_MERCHANT_SALT);
+const PAYU_URL = PAYU_IS_TEST
+    ? (process.env.PAYU_TEST_BASE_URL || 'https://test.payu.in/_payment')
+    : (process.env.PAYU_LIVE_BASE_URL || process.env.PAYU_BASE_URL || 'https://secure.payu.in/_payment');
+const FRONTEND_URL = PAYU_IS_TEST
+    ? (process.env.PAYU_TEST_FRONTEND_URL || process.env.FRONTEND_URL || 'http://localhost:3000')
+    : (process.env.PAYU_LIVE_FRONTEND_URL || process.env.FRONTEND_URL || 'https://mahasuchi.com');
+const BACKEND_URL = PAYU_IS_TEST
+    ? (process.env.PAYU_TEST_BACKEND_URL || process.env.BACKEND_URL || 'http://localhost:8000')
+    : (process.env.PAYU_LIVE_BACKEND_URL || process.env.BACKEND_URL || 'https://api.mahasuchi.com');
 
 // ─── Proxy Config ─────────────────────────────────────────────────────────────
 const PROXY_URL  = process.env.PROXY_URL || 'http://geonode_fLbRzuEUB8-type-residential-country-in:8f20b050-ac4e-474f-a486-8d33b366dfce@proxy.geonode.io:9000';
@@ -291,44 +275,7 @@ const LeadSchema = new mongoose.Schema({
 
 const Lead = mongoose.model('Lead', LeadSchema);
 
-// ─── PDF Cache (post-payment) ────────────────────────────────────────────────
-// Speeds up repeated downloads/refreshes by reusing the already-rendered PDF.
-const PDF_CACHE = new Map(); // cacheKey -> { pdf: Buffer, filename: string, exp: number }
-const PDF_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
-
-function getPdfCacheKey({ district, taluka, village, query, keys }) {
-    const keyList = Array.isArray(keys) ? [...keys].filter(Boolean).sort() : [];
-    const payload = JSON.stringify({
-        district: String(district || ''),
-        taluka: String(taluka || ''),
-        village: String(village || ''),
-        query: String(query || ''),
-        keys: keyList,
-    });
-    return crypto.createHash('sha256').update(payload).digest('hex');
-}
-
-function getCachedPdf(cacheKey) {
-    const e = PDF_CACHE.get(cacheKey);
-    if (!e) return null;
-    if (Date.now() > e.exp) {
-        PDF_CACHE.delete(cacheKey);
-        return null;
-    }
-    return e;
-}
-
-function setCachedPdf(cacheKey, { pdf, filename }) {
-    if (!pdf || !Buffer.isBuffer(pdf)) return;
-    PDF_CACHE.set(cacheKey, { pdf, filename: String(filename || 'Mahasuchi_Report.pdf'), exp: Date.now() + PDF_CACHE_TTL_MS });
-}
-
-setInterval(() => {
-    const now = Date.now();
-    for (const [k, v] of PDF_CACHE.entries()) {
-        if (!v || now > v.exp) PDF_CACHE.delete(k);
-    }
-}, 10 * 60 * 1000);
+// NOTE: Server-side PDF caching removed (PDF is generated client-side now).
 
 // ─── SMTP config visibility ────────────────────────────────────────────────────
 const smtpCfg = getSmtpConfigFromEnv();
@@ -350,38 +297,17 @@ async function getFullRecordsByKeys({ district, taluka, village, query, keys }) 
     const queryMatch = String(query).trim().match(/\d+/);
     const queryNumber = queryMatch ? queryMatch[0] : String(query);
 
-    let matched = getCachedResults(loc, queryNumber);
-    let qNum = queryNumber;
-
-    if (!matched) {
-        const r = await searchPropertyIndex(loc, queryNumber);
-        if (!r.ok) {
-            throw new Error(r.error || 'Failed to load records for PDF');
-        }
-        matched = r.matched;
-        qNum = r.queryNumber;
+    const r = await searchPropertyIndex(loc, queryNumber);
+    if (!r.ok) {
+        throw new Error(r.error || 'Failed to load records');
     }
+    const matched = r.matched;
+    const qNum = r.queryNumber;
 
     const keySet = new Set((keys || []).filter(Boolean));
     const filtered = matched.filter(r => keySet.has(reportData.fingerprint(r)));
     const deduped = reportData.dedupeByKey(filtered);
     return { queryNumber: qNum, records: deduped };
-}
-
-async function generatePdfForContext({ district, taluka, village, query, records }) {
-    const deduped = reportData.dedupeByKey(records || []);
-    if (!deduped.length) {
-        throw new Error('No records available for report generation');
-    }
-    const queryMatch = String(query).trim().match(/\d+/);
-    const queryNumber = queryMatch ? queryMatch[0] : String(query);
-    const pdf = await generatePropertyReportPdf({
-        records: deduped,
-        ctx: { district, taluka, village, query: queryNumber },
-        assetsDir: path.join(__dirname, 'assets'),
-    });
-    const filename = `Mahasuchi_Report_${queryNumber}.pdf`;
-    return { pdf, filename, queryNumber, deduped };
 }
 
 async function tryAutoEmailReport(txnid) {
@@ -399,19 +325,15 @@ async function tryAutoEmailReport(txnid) {
             return { sent: false, skipped: true, reason: 'Lead email missing' };
         }
 
-        const loaded = getCachedResults({ district: lead.district, taluka: lead.taluka, village: lead.village }, lead.query);
-        let matched = loaded;
-        if (!matched) {
-            const r = await searchPropertyIndex({ district: lead.district, taluka: lead.taluka, village: lead.village }, lead.query);
-            if (!r.ok) {
-                await Lead.findOneAndUpdate({ txnid }, {
-                    reportEmailStatus: 'failed',
-                    reportEmailError: 'Failed to load records for auto-email'
-                }).exec();
-                return { sent: false, skipped: true, reason: 'Failed to load records' };
-            }
-            matched = r.matched;
+        const r = await searchPropertyIndex({ district: lead.district, taluka: lead.taluka, village: lead.village }, lead.query);
+        if (!r.ok) {
+            await Lead.findOneAndUpdate({ txnid }, {
+                reportEmailStatus: 'failed',
+                reportEmailError: 'Failed to load records for auto-email'
+            }).exec();
+            return { sent: false, skipped: true, reason: 'Failed to load records' };
         }
+        const matched = r.matched;
         
         const deduped = reportData.dedupeByKey(matched);
         if (!deduped.length) {
@@ -422,35 +344,7 @@ async function tryAutoEmailReport(txnid) {
             return { sent: false, skipped: true, reason: 'No matching records' };
         }
 
-        const { pdf, filename } = await generatePdfForContext({
-            district: lead.district,
-            taluka: lead.taluka,
-            village: lead.village,
-            query: lead.query,
-            records: deduped,
-        });
-
-        const emailRes = await sendReportEmail({
-            to: lead.email,
-            pdfBuffer: pdf,
-            filename,
-            ctx: { district: lead.district, taluka: lead.taluka, village: lead.village, query: lead.query }
-        });
-
-        if (emailRes.sent) {
-            await Lead.findOneAndUpdate({ txnid }, {
-                reportEmailSentAt: new Date(),
-                reportEmailStatus: 'sent',
-                reportEmailError: ''
-            }).exec();
-            return { sent: true };
-        }
-
-        await Lead.findOneAndUpdate({ txnid }, {
-            reportEmailStatus: 'failed',
-            reportEmailError: emailRes.reason || 'SMTP not configured'
-        }).exec();
-        return { sent: false, skipped: true, reason: emailRes.reason || 'SMTP disabled' };
+        return { sent: false, skipped: true, reason: 'Server-side PDF generation disabled; use client upload email flow.' };
     } catch (err) {
         console.error('[email] Auto report email failed', txnid, err && err.message);
         await Lead.findOneAndUpdate({ txnid }, {
@@ -642,11 +536,6 @@ async function searchPropertyIndex(loc, query) {
         return { ok: false, status: 404, error: 'Data file not found for the selected location', details: { filePath } };
     }
 
-    const cached = getCachedResults(loc, queryNumber);
-    if (cached) {
-        return { ok: true, queryNumber, filePath, matched: cached };
-    }
-
     try {
         const matched = [];
         const seenKey = new Set();
@@ -664,7 +553,6 @@ async function searchPropertyIndex(loc, query) {
                 }
             }
         });
-        setCachedResults(loc, queryNumber, matched);
         return { ok: true, queryNumber, filePath, matched };
     } catch (error) {
         const msg = String(error && error.message || '');
@@ -763,113 +651,73 @@ app.post('/api/search/full-by-keys', async (req, res) => {
     }
 });
 
-// ─── /api/report/download ─────────────────────────────────────────────────────
-// POST { token, d, t, v, query, keys } OR { token, district, taluka, village, query, keys }
-// Returns attachment PDF generated server-side (Chromium) with Marathi-accurate rendering.
-app.post('/api/report/download', async (req, res) => {
+// ─── /api/report/email-upload ────────────────────────────────────────────────
+// POST JSON:
+// {
+//   token, to, filename,
+//   pdf_base64, // base64 string (no data: prefix)
+//   ctx: { district, taluka, village, query }
+// }
+// Emails the exact PDF generated by the browser.
+app.post('/api/report/email-upload', async (req, res) => {
     const body = req.body || {};
-    const { token, query, keys } = body;
-
-    const tok = verifyPaymentToken(token);
-    if (!tok.ok) return res.status(tok.status).json({ error: tok.error });
-
-    const loc = getMrLocationFromParams(body);
-    if (!loc) {
-        return res.status(400).json({
-            error: 'Missing location parameters. Send either d, t, v (numeric ids) or district, taluka, village (Marathi).'
-        });
-    }
-    const { district, taluka, village } = loc;
-    if (!query) return res.status(400).json({ error: 'Missing query' });
-    if (!Array.isArray(keys) || keys.length === 0) return res.status(400).json({ error: 'Missing keys' });
-
-    try {
-        const cacheKey = getPdfCacheKey({ district, taluka, village, query, keys });
-        const cached = getCachedPdf(cacheKey);
-        if (cached) {
-            res.setHeader('Content-Type', 'application/pdf');
-            res.setHeader('Content-Disposition', `attachment; filename="${cached.filename.replace(/[^a-zA-Z0-9_.-]/g, '_')}"`);
-            res.setHeader('Content-Length', cached.pdf.byteLength);
-            return res.send(Buffer.from(cached.pdf));
-        }
-
-        const { records } = await getFullRecordsByKeys({ district, taluka, village, query, keys });
-        if (!records.length) return res.status(404).json({ error: 'No records returned for report generation' });
-
-        const { pdf, filename } = await generatePdfForContext({
-            district, taluka, village, query, records
-        });
-
-        setCachedPdf(cacheKey, { pdf: Buffer.from(pdf), filename });
-        res.setHeader('Content-Type', 'application/pdf');
-        res.setHeader('Content-Disposition', `attachment; filename="${filename.replace(/[^a-zA-Z0-9_.-]/g, '_')}"`);
-        res.setHeader('Content-Length', pdf.byteLength);
-        return res.send(Buffer.from(pdf));
-    } catch (error) {
-        console.error('[api/report/download] failed', error && error.message);
-        return res.status(error.status || 500).json({
-            error: error.message || 'Failed to generate report PDF',
-            details: error.details || undefined
-        });
-    }
-});
-
-// ─── /api/report/email ────────────────────────────────────────────────────────
-// POST { token, to, d,t,v, query, keys } OR { token, to, district,taluka,village, query, keys }
-// Sends the same PDF as download flow, but emails it via SMTP.
-// This path does NOT require MongoDB; it is used as a reliable fallback.
-app.post('/api/report/email', async (req, res) => {
-    const body = req.body || {};
-    const { token, query, keys } = body;
+    const { token } = body;
     const to = String(body.to || '').trim();
+    const filename = String(body.filename || 'Mahasuchi_Report.pdf');
+    const pdfBase64 = String(body.pdf_base64 || '').trim();
+    const ctx = (body && typeof body.ctx === 'object' && body.ctx) ? body.ctx : {};
 
     const tok = verifyPaymentToken(token);
     if (!tok.ok) return res.status(tok.status).json({ sent: false, error: tok.error });
     if (!to) return res.status(400).json({ sent: false, error: 'Missing recipient email (to)' });
+    if (!pdfBase64) return res.status(400).json({ sent: false, error: 'Missing pdf_base64' });
 
-    const loc = getMrLocationFromParams(body);
-    if (!loc) {
-        return res.status(400).json({
-            sent: false,
-            error: 'Missing location parameters. Send either d, t, v (numeric ids) or district, taluka, village (Marathi).'
-        });
+    console.log(`[email-upload] request txnid=${tok.txnid || 'unknown'} to=${to} file=${filename}`);
+
+    let pdfBuf;
+    try {
+        pdfBuf = Buffer.from(pdfBase64, 'base64');
+        if (!pdfBuf.length || pdfBuf.slice(0, 4).toString('ascii') !== '%PDF') {
+            return res.status(400).json({ sent: false, error: 'Invalid PDF payload' });
+        }
+        if (pdfBuf.byteLength > 25 * 1024 * 1024) {
+            return res.status(413).json({ sent: false, error: 'PDF too large' });
+        }
+    } catch (_) {
+        return res.status(400).json({ sent: false, error: 'Could not parse pdf_base64' });
     }
-    const { district, taluka, village } = loc;
-    if (!query) return res.status(400).json({ sent: false, error: 'Missing query' });
-    if (!Array.isArray(keys) || keys.length === 0) return res.status(400).json({ sent: false, error: 'Missing keys' });
 
     try {
-        const cacheKey = getPdfCacheKey({ district, taluka, village, query, keys });
-        let cached = getCachedPdf(cacheKey);
-
-        let pdfBuf;
-        let filename;
-        if (cached) {
-            pdfBuf = Buffer.from(cached.pdf);
-            filename = cached.filename;
-        } else {
-            const { records } = await getFullRecordsByKeys({ district, taluka, village, query, keys });
-            if (!records.length) return res.status(404).json({ sent: false, error: 'No records returned for report generation' });
-            const g = await generatePdfForContext({ district, taluka, village, query, records });
-            pdfBuf = Buffer.from(g.pdf);
-            filename = g.filename;
-            setCachedPdf(cacheKey, { pdf: pdfBuf, filename });
-        }
-
         const emailRes = await sendReportEmail({
             to,
             pdfBuffer: pdfBuf,
             filename,
-            ctx: { district, taluka, village, query: String(query) }
+            ctx: {
+                district: String(ctx.district || ''),
+                taluka: String(ctx.taluka || ''),
+                village: String(ctx.village || ''),
+                query: String(ctx.query || ''),
+            }
         });
 
-        if (!emailRes.sent) {
-            return res.status(503).json({ sent: false, error: emailRes.reason || 'Email not sent' });
+        // Best-effort update in Mongo (for admin panel visibility).
+        // Do not fail the API if DB is down.
+        const txnid = tok.txnid;
+        if (txnid) {
+            const upd = emailRes.sent
+                ? { reportEmailSentAt: new Date(), reportEmailStatus: 'sent', reportEmailError: '' }
+                : { reportEmailStatus: 'failed', reportEmailError: String(emailRes.reason || 'Email not sent').slice(0, 300) };
+            Lead.findOneAndUpdate({ txnid }, upd).exec().catch(() => {});
         }
 
+        if (!emailRes.sent) {
+            console.warn(`[email-upload] not sent txnid=${tok.txnid || 'unknown'} reason=${emailRes.reason || 'Email not sent'}`);
+            return res.status(503).json({ sent: false, error: emailRes.reason || 'Email not sent' });
+        }
+        console.log(`[email-upload] sent txnid=${tok.txnid || 'unknown'} to=${to}`);
         return res.json({ sent: true });
     } catch (err) {
-        console.error('[api/report/email] failed', err && err.message);
+        console.error('[api/report/email-upload] failed', err && err.message);
         return res.status(500).json({ sent: false, error: err && err.message ? String(err.message) : 'Failed to send email' });
     }
 });
@@ -913,8 +761,8 @@ app.post('/api/payu/initiate', (req, res) => {
         udf1,
         // PayU typically POSTs to surl/furl. Our React SPA cannot receive POST directly.
         // So PayU posts to backend, we verify + mint token, then redirect to frontend.
-        surl:        `${process.env.BACKEND_URL || 'https://api.mahasuchi.com'}/api/payu/success`,
-        furl:        `${process.env.BACKEND_URL || 'https://api.mahasuchi.com'}/api/payu/failure`,
+        surl:        `${BACKEND_URL}/api/payu/success`,
+        furl:        `${BACKEND_URL}/api/payu/failure`,
         hash,
         action:      PAYU_URL
     });
@@ -924,17 +772,14 @@ app.post('/api/payu/initiate', (req, res) => {
 app.post('/api/payu/success', (req, res) => {
     const params = req.body || {};
     const isValid = verifyPayUHash(params);
-    const frontend = process.env.FRONTEND_URL || 'http://localhost:3000';
+    const frontend = FRONTEND_URL;
 
     if (!isValid || params.status !== 'success') {
         return res.redirect(302, `${frontend}/payment-failure`);
     }
 
     const { token } = issuePaymentToken(params.txnid);
-    // Fire-and-forget support copy email right after successful payment callback.
-    tryAutoEmailReport(params.txnid).then((r) => {
-        if (r && r.sent) console.log(`[email] Report emailed for txnid ${params.txnid}`);
-    }).catch(() => {});
+    // Auto-email moved to client-generated PDF upload flow.
     return res.redirect(302, `${frontend}/payment-success?txnid=${encodeURIComponent(params.txnid)}&token=${encodeURIComponent(token)}`);
 });
 
@@ -947,7 +792,7 @@ app.post('/api/payu/failure', (req, res) => {
             Lead.findOneAndUpdate({ txnid }, { status: 'pending' }).exec().catch(() => {});
         }
     } catch (_) {}
-    const frontend = process.env.FRONTEND_URL || 'http://localhost:3000';
+    const frontend = FRONTEND_URL;
     return res.redirect(302, `${frontend}/payment-failure`);
 });
 
@@ -966,10 +811,7 @@ app.post('/api/payu/verify', (req, res) => {
     }
 
     const { token } = issuePaymentToken(params.txnid);
-    // For gateway flows that hit verify route, also trigger auto-email.
-    tryAutoEmailReport(params.txnid).then((r) => {
-        if (r && r.sent) console.log(`[email] Report emailed for txnid ${params.txnid}`);
-    }).catch(() => {});
+    // Auto-email moved to client-generated PDF upload flow.
     res.json({ verified: true, status: 'success', txnid: params.txnid, token, expires_in_sec: 3650 * 24 * 60 * 60 });
 });
 
@@ -1091,40 +933,11 @@ app.get('/api/admin/search', requireAdminAuth, async (req, res) => {
     return res.json({ count: results.length, results, queryNumber: r.queryNumber });
 });
 
-// Same PDF as paid flow; requires admin JWT (no payment).
-app.post('/api/admin/report', requireAdminAuth, async (req, res) => {
-    const body = req.body || {};
-    const { query, keys } = body;
-    const loc = getMrLocationFromParams(body);
-    if (!loc) {
-        return res.status(400).json({
-            error: 'Missing location. Send d, t, v or district, taluka, village.'
-        });
-    }
-    if (!query) return res.status(400).json({ error: 'Missing query' });
-    if (!Array.isArray(keys) || keys.length === 0) {
-        return res.status(400).json({ error: 'Missing keys' });
-    }
-    const { district, taluka, village } = loc;
-    try {
-        const { records } = await getFullRecordsByKeys({ district, taluka, village, query, keys });
-        if (!records.length) {
-            return res.status(404).json({ error: 'No records returned for report generation' });
-        }
-        const { pdf, filename } = await generatePdfForContext({
-            district, taluka, village, query, records
-        });
-        res.setHeader('Content-Type', 'application/pdf');
-        res.setHeader('Content-Disposition', `attachment; filename="${filename.replace(/[^a-zA-Z0-9_.-]/g, '_')}"`);
-        res.setHeader('Content-Length', pdf.byteLength);
-        return res.send(Buffer.from(pdf));
-    } catch (error) {
-        console.error('[api/admin/report]', error && error.message);
-        return res.status(error.status || 500).json({
-            error: error.message || 'Failed to generate report PDF',
-            details: error.details || undefined
-        });
-    }
+// PDF generation has been moved client-side; this endpoint is disabled.
+app.post('/api/admin/report', requireAdminAuth, async (_req, res) => {
+    return res.status(410).json({
+        error: 'PDF generation moved to client side. This endpoint is deprecated.',
+    });
 });
 
 // ─── /api/merge-pdfs ─────────────────────────────────────────────────────────

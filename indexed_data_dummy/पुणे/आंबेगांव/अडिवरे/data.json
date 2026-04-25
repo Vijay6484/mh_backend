@@ -1,0 +1,69 @@
+[
+  {
+    "document_number": "1234/2019",
+    "document_type": "खरेदीखत",
+    "registration_office": "उप निबंधक कार्यालय, आंबेगांव",
+    "date": "2019-06-18",
+    "seller_party": "रामदास विठ्ठल शिंदे",
+    "buyer_party": "सोनाली रामदास शिंदे",
+    "text": "ही चाचणी (dummy) नोंद आहे. स्थान: अडिवरे, तालुका: आंबेगांव, जिल्हा: पुणे. (फेक डेटा)",
+    "property_numbers": [
+      { "type": "gut_number", "value": "128" },
+      { "type": "survey_number", "value": "128/1" }
+    ],
+    "pdf_link": "https://example.com/fake-pdf/MSC_PUNE_AMBEGAON_ADIVARE_128_1.pdf"
+  },
+  {
+    "document_number": "887/2020",
+    "document_type": "बक्षीसपत्र",
+    "registration_office": "उप निबंधक कार्यालय, मंचर",
+    "date": "2020-11-02",
+    "seller_party": "विठ्ठल गोविंद पाटील",
+    "buyer_party": "अमोल विठ्ठल पाटील",
+    "text": "ही फक्त टेस्टिंगसाठीची नोंद आहे. कोणतीही वास्तविक मालकी दर्शवत नाही. (फेक डेटा)",
+    "property_numbers": [
+      { "type": "gut_number", "value": "128-2" }
+    ],
+    "pdf_link": "https://example.com/fake-pdf/MSC_PUNE_AMBEGAON_ADIVARE_128_2.pdf"
+  },
+  {
+    "document_number": "55/2021",
+    "document_type": "हक्कसोडपत्र",
+    "registration_office": "उप निबंधक कार्यालय, आंबेगांव",
+    "date": "2021-02-10",
+    "seller_party": "शिवाजी गणपत काले",
+    "buyer_party": "पूजा शिवाजी काले",
+    "text": "Dummy record for local testing. Query match example: 572. (फेक डेटा)",
+    "property_numbers": [
+      { "type": "survey_number", "value": "572" }
+    ],
+    "pdf_link": "https://example.com/fake-pdf/MSC_PUNE_AMBEGAON_ADIVARE_572.pdf"
+  },
+  {
+    "document_number": "901/2022",
+    "document_type": "गहाणखत",
+    "registration_office": "उप निबंधक कार्यालय, मंचर",
+    "date": "2022-08-25",
+    "seller_party": "नितीन बाळासाहेब देशमुख",
+    "buyer_party": "स्टेट बँक ऑफ इंडिया (टेस्ट)",
+    "text": "Local dummy dataset: contains multiple property_numbers; will match query 999. (फेक डेटा)",
+    "property_numbers": [
+      { "type": "cts_number", "value": "999" },
+      { "type": "plot_number", "value": "999/3" }
+    ],
+    "pdf_link": "https://example.com/fake-pdf/MSC_PUNE_AMBEGAON_ADIVARE_999.pdf"
+  },
+  {
+    "document_number": "77/2023",
+    "document_type": "करारनामा",
+    "registration_office": "उप निबंधक कार्यालय, आंबेगांव",
+    "date": "2023-01-14",
+    "seller_party": "महेश दत्तात्रय नाईक",
+    "buyer_party": "श्रुती महेश नाईक",
+    "text": "Dummy record; does not match common queries; useful to test non-matching searches. (फेक डेटा)",
+    "property_numbers": [
+      { "type": "gut_number", "value": "450" }
+    ],
+    "pdf_link": "https://example.com/fake-pdf/MSC_PUNE_AMBEGAON_ADIVARE_450.pdf"
+  }
+]
