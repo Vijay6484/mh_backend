@@ -531,7 +531,8 @@ function verifyPayUHash(params) {
             .then(() => console.log(`[PayU] Lead ${txnid} marked as PAID`))
             .catch(err => console.error(`[PayU] Error updating lead status:`, err));
     } else if (isMatched && status !== 'success') {
-        Lead.findOneAndUpdate({ txnid }, { status: 'failed' }).exec()
+        // Per requirement: if payment fails, keep it as pending.
+        Lead.findOneAndUpdate({ txnid }, { status: 'pending' }).exec()
             .catch(() => {});
     }
 
@@ -938,6 +939,14 @@ app.post('/api/payu/success', (req, res) => {
 });
 
 app.post('/api/payu/failure', (req, res) => {
+    // Best-effort: if PayU gives us txnid in failure callback, keep Lead as pending.
+    // (Some setups may not include all fields here.)
+    try {
+        const txnid = req.body && req.body.txnid ? String(req.body.txnid) : '';
+        if (txnid) {
+            Lead.findOneAndUpdate({ txnid }, { status: 'pending' }).exec().catch(() => {});
+        }
+    } catch (_) {}
     const frontend = process.env.FRONTEND_URL || 'http://localhost:3000';
     return res.redirect(302, `${frontend}/payment-failure`);
 });
@@ -1031,13 +1040,18 @@ app.post('/api/admin/login', async (req, res) => {
 
 app.get('/api/admin/stats', requireAdminAuth, async (req, res) => {
     try {
-        const [purchased, totalLeads, pending, failed] = await Promise.all([
+        const [confirmed, totalLeads, pending, failed, emailed, emailFailed] = await Promise.all([
             Lead.countDocuments({ status: 'paid' }),
             Lead.countDocuments({}),
             Lead.countDocuments({ status: 'pending' }),
+            // Keep failed for backward compatibility (may be 0 if you keep failures as pending).
             Lead.countDocuments({ status: 'failed' }),
+            Lead.countDocuments({ reportEmailStatus: 'sent' }),
+            Lead.countDocuments({ reportEmailStatus: 'failed' }),
         ]);
-        return res.json({ purchased, totalLeads, pending, failed });
+        // Backward compat fields:
+        const purchased = confirmed;
+        return res.json({ confirmed, purchased, totalLeads, pending, failed, emailed, emailFailed });
     } catch (err) {
         console.error('[api/admin/stats]', err);
         return res.status(500).json({ error: 'Failed to load stats' });
