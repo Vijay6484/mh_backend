@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const cookieParser = require('cookie-parser');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -26,7 +27,27 @@ const {
 } = require('./services/adminAuth');
 
 const app = express();
-app.use(cors({ origin: '*' }));
+const DEFAULT_ALLOWED_ORIGINS = [
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+    'https://mahasuchi.com',
+    'https://www.mahasuchi.com',
+];
+const ENV_ALLOWED_ORIGINS = String(process.env.CORS_ORIGINS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+const ALLOWED_ORIGINS = new Set([...DEFAULT_ALLOWED_ORIGINS, ...ENV_ALLOWED_ORIGINS]);
+
+app.use(cors({
+    origin(origin, cb) {
+        if (!origin) return cb(null, true); // non-browser clients
+        if (ALLOWED_ORIGINS.has(origin)) return cb(null, true);
+        return cb(new Error(`CORS blocked for origin: ${origin}`));
+    },
+    credentials: true,
+}));
+app.use(cookieParser());
 // Large payload needed for uploading client-generated PDFs.
 app.use(express.json({ limit: '30mb' }));
 // PayU posts back as form-urlencoded
@@ -72,6 +93,35 @@ const INDEX_DIR = process.env.INDEX_DIR
 function parseBoolEnv(v) {
     const s = String(v ?? '').trim().toLowerCase();
     return s === '1' || s === 'true' || s === 'yes' || s === 'on';
+}
+
+function normalizeEmail(email) {
+    return String(email || '').trim().toLowerCase();
+}
+
+function normalizePhone(phone) {
+    const digits = String(phone || '').replace(/\D/g, '');
+    if (!digits) return '';
+    return digits.length > 10 ? digits.slice(-10) : digits;
+}
+
+function maskEmail(email) {
+    const e = normalizeEmail(email);
+    if (!e || !e.includes('@')) return '';
+    const [name, host] = e.split('@');
+    const visible = name.slice(0, 2);
+    return `${visible}${'*'.repeat(Math.max(1, name.length - visible.length))}@${host}`;
+}
+
+function getCookieOptions(maxAgeMs) {
+    const secure = parseBoolEnv(process.env.COOKIE_SECURE || (process.env.NODE_ENV === 'production' ? '1' : '0'));
+    return {
+        httpOnly: true,
+        secure,
+        sameSite: secure ? 'none' : 'lax',
+        maxAge: maxAgeMs,
+        path: '/',
+    };
 }
 
 // locations_index.json: built by `node tools/build_locations_index.js` from locations.json.
@@ -153,6 +203,9 @@ const PAYMENT_JWT_SECRET =
     process.env.ADMIN_JWT_SECRET ||
     process.env.PAYU_MERCHANT_SALT ||
     '';
+const CUSTOMER_JWT_SECRET = process.env.CUSTOMER_JWT_SECRET || PAYMENT_JWT_SECRET;
+const CUSTOMER_JWT_EXPIRES = process.env.CUSTOMER_JWT_EXPIRES || '3650d';
+const CUSTOMER_COOKIE_NAME = 'mahasuchi_customer_token';
 
 function issuePaymentToken(txnid) {
     // If secret missing for some reason, fall back to legacy in-memory token.
@@ -197,6 +250,62 @@ function verifyPaymentToken(token) {
         return { ok: false, status: 401, error: 'Token expired' };
     }
     return { ok: true, txnid: String(payEntry.txnid) };
+}
+
+function issueCustomerSessionToken({ email, phone }) {
+    if (!CUSTOMER_JWT_SECRET) return '';
+    return jwt.sign(
+        {
+            typ: 'cust',
+            email: normalizeEmail(email),
+            phone: normalizePhone(phone),
+        },
+        CUSTOMER_JWT_SECRET,
+        { algorithm: 'HS256', expiresIn: CUSTOMER_JWT_EXPIRES }
+    );
+}
+
+function verifyCustomerSessionToken(token) {
+    if (!CUSTOMER_JWT_SECRET) return { ok: false, status: 503, error: 'Customer auth is not configured' };
+    const t = String(token || '').trim();
+    if (!t) return { ok: false, status: 401, error: 'Missing customer token' };
+    try {
+        const payload = jwt.verify(t, CUSTOMER_JWT_SECRET, { algorithms: ['HS256'] });
+        if (!payload || payload.typ !== 'cust' || !payload.email || !payload.phone) {
+            return { ok: false, status: 401, error: 'Invalid customer token' };
+        }
+        return {
+            ok: true,
+            customer: {
+                email: normalizeEmail(payload.email),
+                phone: normalizePhone(payload.phone),
+            }
+        };
+    } catch (_) {
+        return { ok: false, status: 401, error: 'Invalid or expired customer token' };
+    }
+}
+
+function setCustomerSessionCookies(res, token) {
+    if (!token) return;
+    const tenYearsMs = 3650 * 24 * 60 * 60 * 1000;
+    res.cookie(CUSTOMER_COOKIE_NAME, token, getCookieOptions(tenYearsMs));
+}
+
+function getCustomerTokenFromReq(req) {
+    const hdr = String(req.get('authorization') || '').trim();
+    if (hdr.toLowerCase().startsWith('bearer ')) return hdr.slice('bearer '.length).trim();
+    const c = req.cookies && req.cookies[CUSTOMER_COOKIE_NAME];
+    if (c) return String(c).trim();
+    return '';
+}
+
+function requireCustomerAuth(req, res, next) {
+    const token = getCustomerTokenFromReq(req);
+    const verified = verifyCustomerSessionToken(token);
+    if (!verified.ok) return res.status(verified.status).json({ error: verified.error });
+    req.customer = verified.customer;
+    return next();
 }
 
 function normalizeFsKey(s) {
@@ -260,11 +369,25 @@ mongoose.connect(MONGODB_URI)
 
 const LeadSchema = new mongoose.Schema({
     phone: String,
+    phoneNorm: { type: String, index: true },
     email: String,
+    emailNorm: { type: String, index: true },
     district: String,
     taluka: String,
     village: String,
     query: String,
+    selectedKeys: { type: [String], default: [] },
+    selectedLocationIds: {
+        d: { type: Number, default: null },
+        t: { type: Number, default: null },
+        v: { type: Number, default: null },
+    },
+    selectedLocationEn: {
+        de: { type: String, default: '' },
+        te: { type: String, default: '' },
+        ve: { type: String, default: '' },
+    },
+    propertyType: { type: String, default: '' },
     status: { type: String, enum: ['pending', 'paid', 'failed'], default: 'pending' },
     txnid: { type: String, unique: true },
     reportEmailSentAt: { type: Date, default: null },
@@ -639,6 +762,49 @@ app.post('/api/search/full-by-keys', async (req, res) => {
     }
 
     try {
+        const lead = await Lead.findOne({ txnid: tok.txnid }).lean();
+        if (!lead) {
+            return res.status(404).json({ error: 'Purchase not found for token' });
+        }
+        if (lead.status !== 'paid') {
+            return res.status(403).json({ error: 'Purchase is not marked as paid' });
+        }
+
+        const expectedQuery = String(lead.query || '').trim();
+        const requestedQuery = String(query || '').trim();
+        if (expectedQuery && requestedQuery && expectedQuery !== requestedQuery) {
+            return res.status(403).json({ error: 'Query mismatch for this purchase token' });
+        }
+
+        const reqLoc = getMrLocationFromParams(body);
+        if (!reqLoc) {
+            return res.status(400).json({ error: 'Missing location for this purchase token' });
+        }
+        const expectedByIds = lead.selectedLocationIds && lead.selectedLocationIds.d && lead.selectedLocationIds.t && lead.selectedLocationIds.v
+            ? resolveMrFromIdsFixed(lead.selectedLocationIds.d, lead.selectedLocationIds.t, lead.selectedLocationIds.v)
+            : null;
+        const expectedLoc = expectedByIds || {
+            district: String(lead.district || ''),
+            taluka: String(lead.taluka || ''),
+            village: String(lead.village || ''),
+        };
+        if (
+            normalizeFsKey(expectedLoc.district) !== normalizeFsKey(reqLoc.district) ||
+            normalizeFsKey(expectedLoc.taluka) !== normalizeFsKey(reqLoc.taluka) ||
+            normalizeFsKey(expectedLoc.village) !== normalizeFsKey(reqLoc.village)
+        ) {
+            return res.status(403).json({ error: 'Location mismatch for this purchase token' });
+        }
+
+        const allowedKeys = new Set((lead.selectedKeys || []).filter(Boolean));
+        if (!allowedKeys.size) {
+            return res.status(403).json({ error: 'No downloadable records are mapped to this purchase' });
+        }
+        const invalidRequestedKey = keys.find(k => !allowedKeys.has(String(k)));
+        if (invalidRequestedKey) {
+            return res.status(403).json({ error: 'Requested record is not part of this paid purchase' });
+        }
+
         const { records } = await getFullRecordsByKeys({ district, taluka, village, query, keys });
         const results = reportData.dedupeByKey(records);
         return res.json({ count: results.length, results });
@@ -769,13 +935,27 @@ app.post('/api/payu/initiate', (req, res) => {
 });
 
 // ─── PayU redirect handlers (receive POST, then redirect to frontend) ──────────
-app.post('/api/payu/success', (req, res) => {
+app.post('/api/payu/success', async (req, res) => {
     const params = req.body || {};
     const isValid = verifyPayUHash(params);
     const frontend = FRONTEND_URL;
 
     if (!isValid || params.status !== 'success') {
         return res.redirect(302, `${frontend}/payment-failure`);
+    }
+
+    try {
+        await Lead.findOneAndUpdate({ txnid: String(params.txnid || '') }, { status: 'paid' }).exec();
+        const lead = await Lead.findOne({ txnid: String(params.txnid || '') }).lean();
+        if (lead && lead.email && lead.phone) {
+            const customerToken = issueCustomerSessionToken({
+                email: lead.emailNorm || lead.email,
+                phone: lead.phoneNorm || lead.phone,
+            });
+            setCustomerSessionCookies(res, customerToken);
+        }
+    } catch (e) {
+        console.error('[payu/success] failed to set customer session', e && e.message);
     }
 
     const { token } = issuePaymentToken(params.txnid);
@@ -818,27 +998,174 @@ app.post('/api/payu/verify', (req, res) => {
 // ─── /api/leads ─────────────────────────────────────────────────────────────
 // Called from frontend popup to store initial lead data
 app.post('/api/leads', async (req, res) => {
-    const { phone, email, district, taluka, village, query, txnid } = req.body;
+    const {
+        phone,
+        email,
+        district,
+        taluka,
+        village,
+        query,
+        txnid,
+        selectedKeys,
+        d,
+        t,
+        v,
+        de,
+        te,
+        ve,
+        propertyType,
+    } = req.body;
+    const sessionToken = getCustomerTokenFromReq(req);
+    let sessionCustomer = null;
+    if (sessionToken) {
+        const verified = verifyCustomerSessionToken(sessionToken);
+        if (!verified.ok) {
+            return res.status(401).json({ error: 'Invalid customer session. Please login again.' });
+        }
+        sessionCustomer = verified.customer;
+    }
+
+    // If customer session already exists, force lead identity to same email/phone.
+    // This keeps admin panel attribution stable across repeat purchases.
+    const emailNorm = sessionCustomer ? sessionCustomer.email : normalizeEmail(email);
+    const phoneNorm = sessionCustomer ? sessionCustomer.phone : normalizePhone(phone);
+    const emailToStore = sessionCustomer ? sessionCustomer.email : String(email || '').trim();
+    const phoneToStore = sessionCustomer ? sessionCustomer.phone : String(phone || '').trim();
+    if (!emailNorm || !phoneNorm) {
+        return res.status(400).json({ error: 'Missing email or phone' });
+    }
+    const cleanKeys = Array.isArray(selectedKeys)
+        ? Array.from(new Set(selectedKeys.map(k => String(k || '').trim()).filter(Boolean))).slice(0, 1000)
+        : [];
     try {
         const lead = new Lead({
-            phone,
-            email,
+            phone: phoneToStore,
+            phoneNorm,
+            email: emailToStore,
+            emailNorm,
             district,
             taluka,
             village,
             query,
             txnid,
+            selectedKeys: cleanKeys,
+            selectedLocationIds: {
+                d: Number.isFinite(Number(d)) ? Number(d) : null,
+                t: Number.isFinite(Number(t)) ? Number(t) : null,
+                v: Number.isFinite(Number(v)) ? Number(v) : null,
+            },
+            selectedLocationEn: {
+                de: String(de || ''),
+                te: String(te || ''),
+                ve: String(ve || ''),
+            },
+            propertyType: String(propertyType || ''),
             status: 'pending'
         });
         await lead.save();
         console.log(`[leads] New lead saved: ${phone} / ${txnid}`);
-        res.json({ success: true });
+        const customerToken = issueCustomerSessionToken({ email: emailNorm, phone: phoneNorm });
+        setCustomerSessionCookies(res, customerToken);
+        res.json({ success: true, customerToken });
     } catch (err) {
         console.error('[leads] Save error:', err);
         // If txnid duplicate (user retrying), just return success
-        if (err.code === 11000) return res.json({ success: true });
+        if (err.code === 11000) {
+            const customerToken = issueCustomerSessionToken({ email: emailNorm, phone: phoneNorm });
+            setCustomerSessionCookies(res, customerToken);
+            return res.json({ success: true, customerToken });
+        }
         res.status(500).json({ error: 'Failed to save lead' });
     }
+});
+
+app.post('/api/customer/session/login', async (req, res) => {
+    const emailNorm = normalizeEmail(req.body && req.body.email);
+    const phoneNorm = normalizePhone(req.body && req.body.phone);
+    if (!emailNorm || !phoneNorm) {
+        return res.status(400).json({ error: 'Email and phone are required' });
+    }
+    const leadExists = await Lead.exists({ emailNorm, phoneNorm });
+    if (!leadExists) {
+        return res.status(401).json({ error: 'Customer not found' });
+    }
+    const customerToken = issueCustomerSessionToken({ email: emailNorm, phone: phoneNorm });
+    setCustomerSessionCookies(res, customerToken);
+    return res.json({
+        ok: true,
+        customerToken,
+        customer: { email: emailNorm, phone: phoneNorm, emailMasked: maskEmail(emailNorm) },
+    });
+});
+
+app.get('/api/customer/session/me', requireCustomerAuth, async (req, res) => {
+    const emailNorm = req.customer.email;
+    const phoneNorm = req.customer.phone;
+    const paidCount = await Lead.countDocuments({ emailNorm, phoneNorm, status: 'paid' });
+    return res.json({
+        ok: true,
+        customer: {
+            email: emailNorm,
+            phone: phoneNorm,
+            emailMasked: maskEmail(emailNorm),
+            hasPaidPurchases: paidCount > 0,
+        },
+    });
+});
+
+app.get('/api/customer/downloads', requireCustomerAuth, async (req, res) => {
+    const emailNorm = req.customer.email;
+    const phoneNorm = req.customer.phone;
+    const leads = await Lead.find({ emailNorm, phoneNorm, status: 'paid' })
+        .sort({ createdAt: -1 })
+        .limit(200)
+        .lean();
+    const downloads = leads.map((lead) => ({
+        txnid: lead.txnid,
+        query: lead.query,
+        district: lead.district,
+        taluka: lead.taluka,
+        village: lead.village,
+        createdAt: lead.createdAt,
+        keyCount: Array.isArray(lead.selectedKeys) ? lead.selectedKeys.length : 0,
+        selectedLocationIds: lead.selectedLocationIds || null,
+        selectedLocationEn: lead.selectedLocationEn || null,
+    }));
+    return res.json({ count: downloads.length, downloads });
+});
+
+app.post('/api/customer/downloads/:txnid/bootstrap', requireCustomerAuth, async (req, res) => {
+    const txnid = String(req.params.txnid || '').trim();
+    if (!txnid) return res.status(400).json({ error: 'Missing txnid' });
+    const emailNorm = req.customer.email;
+    const phoneNorm = req.customer.phone;
+    const lead = await Lead.findOne({ txnid, emailNorm, phoneNorm, status: 'paid' }).lean();
+    if (!lead) {
+        return res.status(404).json({ error: 'Paid purchase not found for this customer' });
+    }
+    const keys = Array.isArray(lead.selectedKeys) ? lead.selectedKeys.filter(Boolean) : [];
+    if (!keys.length) {
+        return res.status(403).json({ error: 'No paid records were saved for this transaction' });
+    }
+    const { token } = issuePaymentToken(txnid);
+    return res.json({
+        txnid,
+        token,
+        records: keys.map((key) => ({ key })),
+        ctx: {
+            d: lead.selectedLocationIds && lead.selectedLocationIds.d != null ? String(lead.selectedLocationIds.d) : '',
+            t: lead.selectedLocationIds && lead.selectedLocationIds.t != null ? String(lead.selectedLocationIds.t) : '',
+            v: lead.selectedLocationIds && lead.selectedLocationIds.v != null ? String(lead.selectedLocationIds.v) : '',
+            de: lead.selectedLocationEn && lead.selectedLocationEn.de ? String(lead.selectedLocationEn.de) : '',
+            te: lead.selectedLocationEn && lead.selectedLocationEn.te ? String(lead.selectedLocationEn.te) : '',
+            ve: lead.selectedLocationEn && lead.selectedLocationEn.ve ? String(lead.selectedLocationEn.ve) : '',
+            district: String(lead.district || ''),
+            taluka: String(lead.taluka || ''),
+            village: String(lead.village || ''),
+            query: String(lead.query || ''),
+            propertyType: String(lead.propertyType || ''),
+        }
+    });
 });
 
 // ─── /api/admin/* (JWT + bcrypt; configure ADMIN_USER, ADMIN_PASS_HASH, ADMIN_JWT_SECRET) ─
