@@ -27,26 +27,9 @@ const {
 } = require('./services/adminAuth');
 
 const app = express();
-const DEFAULT_ALLOWED_ORIGINS = [
-    'http://localhost:3000',
-    'http://127.0.0.1:3000',
-    'https://mahasuchi.com',
-    'https://www.mahasuchi.com',
-];
-const ENV_ALLOWED_ORIGINS = String(process.env.CORS_ORIGINS || '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
-const ALLOWED_ORIGINS = new Set([...DEFAULT_ALLOWED_ORIGINS, ...ENV_ALLOWED_ORIGINS]);
 
-app.use(cors({
-    origin(origin, cb) {
-        if (!origin) return cb(null, true); // non-browser clients
-        if (ALLOWED_ORIGINS.has(origin)) return cb(null, true);
-        return cb(new Error(`CORS blocked for origin: ${origin}`));
-    },
-    credentials: true,
-}));
+// Reflect any Origin (required when credentials: true; * is invalid with cookies).
+app.use(cors({ origin: true, credentials: true }));
 app.use(cookieParser());
 // Large payload needed for uploading client-generated PDFs.
 app.use(express.json({ limit: '30mb' }));
