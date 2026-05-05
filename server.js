@@ -882,7 +882,7 @@ app.post('/api/payu/initiate', (req, res) => {
     }
 
     // Pricing is enforced server-side so clients cannot tamper with amount.
-    const REPORT_FEE_INR = 699;
+    const REPORT_FEE_INR = 999;
     const GST_RATE = 0.18;
     const amtFixed = (REPORT_FEE_INR * (1 + GST_RATE)).toFixed(2);
 
