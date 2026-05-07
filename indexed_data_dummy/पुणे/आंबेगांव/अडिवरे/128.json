@@ -1,0 +1,38 @@
+[
+  {
+    "document_number": "1234/2019",
+    "document_type": "खरेदीखत",
+    "registration_office": "उप निबंधक कार्यालय, आंबेगांव",
+    "date": "2019-06-18",
+    "seller_party": "रामदास विठ्ठल शिंदे",
+    "buyer_party": "सोनाली रामदास शिंदे",
+    "text": "ही चाचणी (dummy) नोंद आहे. स्थान: अडिवरे, तालुका: आंबेगांव, जिल्हा: पुणे. (फेक डेटा)",
+    "property_numbers": [
+      {
+        "type": "gut_number",
+        "value": "128"
+      },
+      {
+        "type": "survey_number",
+        "value": "128/1"
+      }
+    ],
+    "pdf_link": "https://example.com/fake-pdf/MSC_PUNE_AMBEGAON_ADIVARE_128_1.pdf"
+  },
+  {
+    "document_number": "887/2020",
+    "document_type": "बक्षीसपत्र",
+    "registration_office": "उप निबंधक कार्यालय, मंचर",
+    "date": "2020-11-02",
+    "seller_party": "विठ्ठल गोविंद पाटील",
+    "buyer_party": "अमोल विठ्ठल पाटील",
+    "text": "ही फक्त टेस्टिंगसाठीची नोंद आहे. कोणतीही वास्तविक मालकी दर्शवत नाही. (फेक डेटा)",
+    "property_numbers": [
+      {
+        "type": "gut_number",
+        "value": "128-2"
+      }
+    ],
+    "pdf_link": "https://example.com/fake-pdf/MSC_PUNE_AMBEGAON_ADIVARE_128_2.pdf"
+  }
+]

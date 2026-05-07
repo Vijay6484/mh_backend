@@ -1,0 +1,18 @@
+[
+  {
+    "document_number": "77/2023",
+    "document_type": "करारनामा",
+    "registration_office": "उप निबंधक कार्यालय, आंबेगांव",
+    "date": "2023-01-14",
+    "seller_party": "महेश दत्तात्रय नाईक",
+    "buyer_party": "श्रुती महेश नाईक",
+    "text": "Dummy record; does not match common queries; useful to test non-matching searches. (फेक डेटा)",
+    "property_numbers": [
+      {
+        "type": "gut_number",
+        "value": "450"
+      }
+    ],
+    "pdf_link": "https://example.com/fake-pdf/MSC_PUNE_AMBEGAON_ADIVARE_450.pdf"
+  }
+]

@@ -637,15 +637,42 @@ async function searchPropertyIndex(loc, query) {
         return { ok: false, status: 404, error: 'Village not found in index' };
     }
 
-    const filePath = path.join(talukaDir, resolvedVillage, 'data.json');
-    if (!fs.existsSync(filePath)) {
-        return { ok: false, status: 404, error: 'Data file not found for the selected location', details: { filePath } };
-    }
+    const villageDir = path.join(talukaDir, resolvedVillage);
+
+    // New fast index layout (O(1) lookup):
+    // <INDEX_DIR>/<district>/<taluka>/<village>/<gut>.json
+    // Falls back to legacy: .../<village>/data.json if sharded file not present.
+    const shardedPath = path.join(villageDir, `${queryNumber}.json`);
+    const legacyPath = path.join(villageDir, 'data.json');
 
     try {
+        if (fs.existsSync(shardedPath)) {
+            // Sharded file already contains only the relevant gut-number documents.
+            const raw = fs.readFileSync(shardedPath, 'utf8');
+            const arr = JSON.parse(raw);
+            if (!Array.isArray(arr)) {
+                return {
+                    ok: false,
+                    status: 422,
+                    error: 'Indexed data file must be a top-level JSON array',
+                    details: { filePath: shardedPath }
+                };
+            }
+            return { ok: true, queryNumber, filePath: shardedPath, matched: arr };
+        }
+
+        if (!fs.existsSync(legacyPath)) {
+            return {
+                ok: false,
+                status: 404,
+                error: 'Data file not found for the selected location',
+                details: { filePath: legacyPath, shardedTried: shardedPath }
+            };
+        }
+
         const matched = [];
         const seenKey = new Set();
-        await forEachRecordInDataJson(filePath, (record) => {
+        await forEachRecordInDataJson(legacyPath, (record) => {
             if (record.property_numbers && Array.isArray(record.property_numbers)) {
                 for (const prop of record.property_numbers) {
                     const baseNumber = String(prop.value).split(/[\/\-]/)[0].trim();
@@ -659,11 +686,12 @@ async function searchPropertyIndex(loc, query) {
                 }
             }
         });
-        return { ok: true, queryNumber, filePath, matched };
+        return { ok: true, queryNumber, filePath: legacyPath, matched };
     } catch (error) {
         const msg = String(error && error.message || '');
         const isStructure = msg.includes('Top-level object should be an array');
         const isOom = /allocation|out of memory|string length|Invalid string length/i.test(msg);
+        const filePath = fs.existsSync(shardedPath) ? shardedPath : legacyPath;
         return {
             ok: false,
             status: isStructure ? 422 : isOom ? 500 : 422,
@@ -1298,4 +1326,13 @@ app.post('/api/merge-pdfs', async (req, res) => {
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 8000;
-app.listen(PORT, () => console.log(`Mahasuchi Backend running on port ${PORT}`));
+
+// Export for Lambda / tests
+module.exports = { app };
+
+// Only start a local HTTP server when run directly:
+// - `node server.js` (local/dev)
+// - not when imported by AWS Lambda handler
+if (require.main === module) {
+    app.listen(PORT, () => console.log(`Mahasuchi Backend running on port ${PORT}`));
+}
