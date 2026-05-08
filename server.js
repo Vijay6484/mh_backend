@@ -12,7 +12,6 @@ const mongoose = require('mongoose');
 const axios = require('axios');
 const reportData = require('./services/reportData');
 const { getSmtpConfigFromEnv, validateSmtpConfig, sendReportEmail } = require('./services/mailer');
-const { forEachRecordInDataJson } = require('./services/streamDataJson');
 const {
     isAdminEnvConfigured,
     getClientId,
@@ -411,9 +410,8 @@ async function getFullRecordsByKeys({ district, taluka, village, query, keys }) 
     const qNum = r.queryNumber;
 
     const keySet = new Set((keys || []).filter(Boolean));
-    const filtered = matched.filter(r => keySet.has(r.key || reportData.fingerprint(r)));
-    const deduped = reportData.dedupeByKey(filtered);
-    return { queryNumber: qNum, records: deduped };
+    const filtered = matched.filter(r => r && r.key && keySet.has(r.key));
+    return { queryNumber: qNum, records: filtered };
 }
 
 async function tryAutoEmailReport(txnid) {
@@ -641,74 +639,33 @@ async function searchPropertyIndex(loc, query) {
 
     // New fast index layout (O(1) lookup):
     // <INDEX_DIR>/<district>/<taluka>/<village>/<gut>.json
-    // Falls back to legacy: .../<village>/data.json if sharded file not present.
+    // If shard file is missing, treat it as "no data" for that query.
     const shardedPath = path.join(villageDir, `${queryNumber}.json`);
-    const legacyPath = path.join(villageDir, 'data.json');
 
     try {
-        if (fs.existsSync(shardedPath)) {
-            // Sharded file already contains only the relevant gut-number documents.
-            const raw = fs.readFileSync(shardedPath, 'utf8');
-            const arr = JSON.parse(raw);
-            if (!Array.isArray(arr)) {
-                return {
-                    ok: false,
-                    status: 422,
-                    error: 'Indexed data file must be a top-level JSON array',
-                    details: { filePath: shardedPath }
-                };
-            }
-            
-            // Fast O(N) dedupe: First remove exact JSON duplicates to reduce size instantly
-            const seenStr = new Set();
-            const fastUnique = [];
-            for (const r of arr) {
-                if (!r) continue;
-                const s = JSON.stringify(r);
-                if (!seenStr.has(s)) {
-                    seenStr.add(s);
-                    fastUnique.push(r);
-                }
-            }
-            
-            // Second pass: apply semantic deduplication and assign .key
-            const matched = reportData.dedupeByKey(fastUnique);
-            
-            return { ok: true, queryNumber, filePath: shardedPath, matched };
+        if (!fs.existsSync(shardedPath)) {
+            return { ok: true, queryNumber, filePath: shardedPath, matched: [] };
         }
 
-        if (!fs.existsSync(legacyPath)) {
+        // Sharded file already contains only the relevant gut-number documents.
+        const raw = fs.readFileSync(shardedPath, 'utf8');
+        const arr = JSON.parse(raw);
+        if (!Array.isArray(arr)) {
             return {
                 ok: false,
-                status: 404,
-                error: 'Data file not found for the selected location',
-                details: { filePath: legacyPath, shardedTried: shardedPath }
+                status: 422,
+                error: 'Indexed data file must be a top-level JSON array',
+                details: { filePath: shardedPath }
             };
         }
 
-        const matched = [];
-        const seenKey = new Set();
-        await forEachRecordInDataJson(legacyPath, (record) => {
-            if (record.property_numbers && Array.isArray(record.property_numbers)) {
-                for (const prop of record.property_numbers) {
-                    const baseNumber = String(prop.value).split(/[\/\-]/)[0].trim();
-                    if (baseNumber === String(queryNumber)) {
-                        const key = reportData.fingerprint(record);
-                        if (seenKey.has(key)) return;
-                        seenKey.add(key);
-                        record.key = key;
-                        matched.push(record);
-                        return;
-                    }
-                }
-            }
-        });
-        return { ok: true, queryNumber, filePath: legacyPath, matched };
+        // Single-pass semantic dedupe + key assignment (linear time on shard size).
+        const matched = reportData.dedupeByKey(arr);
+        return { ok: true, queryNumber, filePath: shardedPath, matched };
     } catch (error) {
         const msg = String(error && error.message || '');
         const isStructure = msg.includes('Top-level object should be an array');
         const isOom = /allocation|out of memory|string length|Invalid string length/i.test(msg);
-        const filePath = fs.existsSync(shardedPath) ? shardedPath : legacyPath;
         return {
             ok: false,
             status: isStructure ? 422 : isOom ? 500 : 422,
@@ -717,7 +674,7 @@ async function searchPropertyIndex(loc, query) {
                 : isOom
                     ? 'Indexed data file is too large to process on this server'
                     : (msg || 'Failed to read indexed data file'),
-            details: { filePath }
+            details: { filePath: shardedPath }
         };
     }
 }
@@ -834,8 +791,7 @@ app.post('/api/search/full-by-keys', async (req, res) => {
         }
 
         const { records } = await getFullRecordsByKeys({ district, taluka, village, query, keys });
-        const results = reportData.dedupeByKey(records);
-        return res.json({ count: results.length, results });
+        return res.json({ count: records.length, results: records });
     } catch (error) {
         console.error('[api/search/full-by-keys] failed', error && error.message);
         return res.status(error.status || 500).json({
