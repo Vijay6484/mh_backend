@@ -5,6 +5,7 @@ const cookieParser = require('cookie-parser');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const zlib = require('zlib');
 const jwt = require('jsonwebtoken');
 const { PDFDocument } = require('pdf-lib');
 const { HttpsProxyAgent } = require('https-proxy-agent');
@@ -188,6 +189,92 @@ const PAYMENT_JWT_SECRET =
 const CUSTOMER_JWT_SECRET = process.env.CUSTOMER_JWT_SECRET || PAYMENT_JWT_SECRET;
 const CUSTOMER_JWT_EXPIRES = process.env.CUSTOMER_JWT_EXPIRES || '3650d';
 const CUSTOMER_COOKIE_NAME = 'mahasuchi_customer_token';
+const SEALED_CACHE_TTL_MS = 48 * 60 * 60 * 1000;
+const SEARCH_SEAL_SECRET =
+    process.env.SEARCH_SEAL_SECRET ||
+    PAYMENT_JWT_SECRET ||
+    process.env.PAYU_MERCHANT_SALT ||
+    '';
+
+function hashDeviceId(deviceId) {
+    const d = String(deviceId || '').trim();
+    if (!d) return '';
+    return crypto.createHash('sha256').update(d).digest('base64url');
+}
+
+function deriveWrapKey(lockId) {
+    if (!SEARCH_SEAL_SECRET) return null;
+    return crypto
+        .createHash('sha256')
+        .update(`${SEARCH_SEAL_SECRET}|${String(lockId || '')}`)
+        .digest();
+}
+
+function aesGcmEncrypt(plainBuf, keyBuf) {
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', keyBuf, iv);
+    const out = Buffer.concat([cipher.update(plainBuf), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    return {
+        iv: iv.toString('base64url'),
+        tag: tag.toString('base64url'),
+        data: out.toString('base64url'),
+    };
+}
+
+function aesGcmDecrypt({ iv, tag, data }, keyBuf) {
+    const decipher = crypto.createDecipheriv(
+        'aes-256-gcm',
+        keyBuf,
+        Buffer.from(String(iv || ''), 'base64url')
+    );
+    decipher.setAuthTag(Buffer.from(String(tag || ''), 'base64url'));
+    return Buffer.concat([
+        decipher.update(Buffer.from(String(data || ''), 'base64url')),
+        decipher.final(),
+    ]);
+}
+
+function createSealedPayload({ records, queryNumber, district, taluka, village }) {
+    const lockId = crypto.randomBytes(18).toString('base64url');
+    const wrapKey = deriveWrapKey(lockId);
+    if (!wrapKey) return null;
+
+    const payload = {
+        v: 1,
+        queryNumber: String(queryNumber || ''),
+        ctx: {
+            district: String(district || ''),
+            taluka: String(taluka || ''),
+            village: String(village || ''),
+        },
+        records: Array.isArray(records) ? records : [],
+        createdAt: Date.now(),
+    };
+    const payloadJson = Buffer.from(JSON.stringify(payload), 'utf8');
+    const gz = zlib.gzipSync(payloadJson, { level: 6 });
+    const dataKey = crypto.randomBytes(32);
+    const encPayload = aesGcmEncrypt(gz, dataKey);
+    const wrappedKey = aesGcmEncrypt(dataKey, wrapKey);
+    return {
+        v: 1,
+        alg: 'A256GCM+GZIP',
+        lockId,
+        wrappedKey,
+        payload: encPayload,
+        expiresAt: Date.now() + SEALED_CACHE_TTL_MS,
+    };
+}
+
+function unwrapSealedDataKey({ lockId, wrappedKey }) {
+    const wrapKey = deriveWrapKey(lockId);
+    if (!wrapKey) throw new Error('Sealed payload secret is not configured');
+    const dataKey = aesGcmDecrypt(wrappedKey || {}, wrapKey);
+    if (!Buffer.isBuffer(dataKey) || dataKey.length !== 32) {
+        throw new Error('Invalid sealed payload key');
+    }
+    return dataKey;
+}
 
 function issuePaymentToken(txnid) {
     // If secret missing for some reason, fall back to legacy in-memory token.
@@ -369,6 +456,8 @@ const LeadSchema = new mongoose.Schema({
         te: { type: String, default: '' },
         ve: { type: String, default: '' },
     },
+    deviceIdHash: { type: String, default: '' },
+    sealedLockId: { type: String, default: '' },
     propertyType: { type: String, default: '' },
     status: { type: String, enum: ['pending', 'paid', 'failed'], default: 'pending' },
     txnid: { type: String, unique: true },
@@ -708,17 +797,24 @@ app.get('/api/search', async (req, res) => {
     const providedKey = req.get('x-full-search-key') || '';
     const serverKey = process.env.SEARCH_FULL_API_KEY || '';
     const allowFull = Boolean(serverKey) && wantsFull && providedKey === serverKey;
+    const fullRows = matched.map((row) => ({ ...row, key: row.key || reportData.fingerprint(row) }));
+    const sealed = createSealedPayload({
+        records: fullRows,
+        queryNumber,
+        district: loc.district,
+        taluka: loc.taluka,
+        village: loc.village,
+    });
 
     if (allowFull) {
-        const results = matched.map((row) => ({ ...row, key: row.key || reportData.fingerprint(row) }));
-        return res.json({ count: results.length, results, queryNumber });
+        return res.json({ count: fullRows.length, results: fullRows, queryNumber, sealed });
     }
 
-    const results = matched.map((row) => ({
+    const results = fullRows.map((row) => ({
         document_type: row.document_type || 'Unknown',
-        key: row.key || reportData.fingerprint(row)
+        key: row.key
     }));
-    return res.json({ count: results.length, results, queryNumber });
+    return res.json({ count: results.length, results, queryNumber, sealed });
 });
 
 // ─── /api/search/full-by-keys ─────────────────────────────────────────────────
@@ -798,6 +894,53 @@ app.post('/api/search/full-by-keys', async (req, res) => {
             error: error.message || 'Failed to load full records',
             details: error.details || undefined
         });
+    }
+});
+
+// ─── /api/payment/unlock-key ──────────────────────────────────────────────────
+// POST { token, lockId, wrappedKey, deviceId }
+// Returns a short-lived decode key for a sealed payload after payment.
+app.post('/api/payment/unlock-key', async (req, res) => {
+    const body = req.body || {};
+    const { token, lockId, wrappedKey, deviceId } = body;
+    const tok = verifyPaymentToken(token);
+    if (!tok.ok) return res.status(tok.status).json({ error: tok.error });
+    if (!lockId || typeof lockId !== 'string') {
+        return res.status(400).json({ error: 'Missing lockId' });
+    }
+    if (!wrappedKey || typeof wrappedKey !== 'object') {
+        return res.status(400).json({ error: 'Missing wrappedKey' });
+    }
+
+    try {
+        const lead = await Lead.findOne({ txnid: tok.txnid }).lean();
+        if (!lead) return res.status(404).json({ error: 'Purchase not found for token' });
+        if (lead.status !== 'paid') return res.status(403).json({ error: 'Purchase is not marked as paid' });
+        if (!lead.sealedLockId) return res.status(403).json({ error: 'No sealed payload is linked to this purchase' });
+        if (String(lead.sealedLockId) !== String(lockId)) {
+            return res.status(403).json({ error: 'Lock mismatch for this purchase token' });
+        }
+        const leadCreatedAt = lead.createdAt ? new Date(lead.createdAt).getTime() : Date.now();
+        if (Date.now() > leadCreatedAt + SEALED_CACHE_TTL_MS) {
+            return res.status(410).json({ error: 'This sealed payload has expired. Please search again.' });
+        }
+
+        const expectedDeviceHash = String(lead.deviceIdHash || '');
+        if (expectedDeviceHash) {
+            const providedHash = hashDeviceId(deviceId);
+            if (!providedHash || providedHash !== expectedDeviceHash) {
+                return res.status(403).json({ error: 'This device is not authorized for decoding this purchase' });
+            }
+        }
+
+        const dataKey = unwrapSealedDataKey({ lockId, wrappedKey });
+        return res.json({
+            ok: true,
+            unlockKey: dataKey.toString('base64url'),
+            expiresAt: Math.min(Date.now() + 10 * 60 * 1000, leadCreatedAt + SEALED_CACHE_TTL_MS),
+        });
+    } catch (error) {
+        return res.status(422).json({ error: error.message || 'Failed to unlock sealed payload' });
     }
 });
 
@@ -998,6 +1141,8 @@ app.post('/api/leads', async (req, res) => {
         te,
         ve,
         propertyType,
+        deviceId,
+        sealedLockId,
     } = req.body;
     const sessionToken = getCustomerTokenFromReq(req);
     let sessionCustomer = null;
@@ -1043,6 +1188,8 @@ app.post('/api/leads', async (req, res) => {
                 te: String(te || ''),
                 ve: String(ve || ''),
             },
+            deviceIdHash: hashDeviceId(deviceId),
+            sealedLockId: String(sealedLockId || '').trim(),
             propertyType: String(propertyType || ''),
             status: 'pending'
         });
@@ -1055,6 +1202,15 @@ app.post('/api/leads', async (req, res) => {
         console.error('[leads] Save error:', err);
         // If txnid duplicate (user retrying), just return success
         if (err.code === 11000) {
+            await Lead.findOneAndUpdate(
+                { txnid },
+                {
+                    $set: {
+                        deviceIdHash: hashDeviceId(deviceId),
+                        sealedLockId: String(sealedLockId || '').trim(),
+                    }
+                }
+            ).exec().catch(() => {});
             const customerToken = issueCustomerSessionToken({ email: emailNorm, phone: phoneNorm });
             setCustomerSessionCookies(res, customerToken);
             return res.json({ success: true, customerToken });
@@ -1140,6 +1296,7 @@ app.post('/api/customer/downloads/:txnid/bootstrap', requireCustomerAuth, async 
             d: lead.selectedLocationIds && lead.selectedLocationIds.d != null ? String(lead.selectedLocationIds.d) : '',
             t: lead.selectedLocationIds && lead.selectedLocationIds.t != null ? String(lead.selectedLocationIds.t) : '',
             v: lead.selectedLocationIds && lead.selectedLocationIds.v != null ? String(lead.selectedLocationIds.v) : '',
+            lockId: String(lead.sealedLockId || ''),
             de: lead.selectedLocationEn && lead.selectedLocationEn.de ? String(lead.selectedLocationEn.de) : '',
             te: lead.selectedLocationEn && lead.selectedLocationEn.te ? String(lead.selectedLocationEn.te) : '',
             ve: lead.selectedLocationEn && lead.selectedLocationEn.ve ? String(lead.selectedLocationEn.ve) : '',
