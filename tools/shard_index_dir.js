@@ -8,12 +8,23 @@
  *   <indexDir>/<district>/<taluka>/<village>/<gut>.json
  *
  * Notes:
- * - Only shards `property_numbers` entries where type === "gut_number"
+ * - Shards land-number `property_numbers` types:
+ *   gut_number, survey_number, cts_number, plot_number, milkat_number, bhumapan_number, block_number
  * - "540/2/3" and "128-2" shard into "540.json" and "128.json"
  * - A document can be written into multiple gut files if it mentions multiple gut numbers
  */
 const fs = require('fs');
 const path = require('path');
+
+const LAND_NUMBER_TYPES = new Set([
+  'gut_number',
+  'survey_number',
+  'cts_number',
+  'plot_number',
+  'milkat_number',
+  'bhumapan_number',
+  'block_number',
+]);
 
 function baseGutNumber(raw) {
   const s = String(raw || '').trim();
@@ -43,7 +54,7 @@ function shardVillageFile(dataPath) {
     if (!Array.isArray(props)) continue;
     const guts = new Set();
     for (const p of props) {
-      if (!p || p.type !== 'gut_number') continue;
+      if (!p || !LAND_NUMBER_TYPES.has(p.type)) continue;
       const g = baseGutNumber(p.value);
       if (g) guts.add(g);
     }

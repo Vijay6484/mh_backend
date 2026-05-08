@@ -1,0 +1,22 @@
+[
+  {
+    "document_number": "901/2022",
+    "document_type": "गहाणखत",
+    "registration_office": "उप निबंधक कार्यालय, मंचर",
+    "date": "2022-08-25",
+    "seller_party": "नितीन बाळासाहेब देशमुख",
+    "buyer_party": "स्टेट बँक ऑफ इंडिया (टेस्ट)",
+    "text": "Local dummy dataset: contains multiple property_numbers; will match query 999. (फेक डेटा)",
+    "property_numbers": [
+      {
+        "type": "cts_number",
+        "value": "999"
+      },
+      {
+        "type": "plot_number",
+        "value": "999/3"
+      }
+    ],
+    "pdf_link": "https://example.com/fake-pdf/MSC_PUNE_AMBEGAON_ADIVARE_999.pdf"
+  }
+]

@@ -411,7 +411,7 @@ async function getFullRecordsByKeys({ district, taluka, village, query, keys }) 
     const qNum = r.queryNumber;
 
     const keySet = new Set((keys || []).filter(Boolean));
-    const filtered = matched.filter(r => keySet.has(reportData.fingerprint(r)));
+    const filtered = matched.filter(r => keySet.has(r.key || reportData.fingerprint(r)));
     const deduped = reportData.dedupeByKey(filtered);
     return { queryNumber: qNum, records: deduped };
 }
@@ -658,7 +658,23 @@ async function searchPropertyIndex(loc, query) {
                     details: { filePath: shardedPath }
                 };
             }
-            return { ok: true, queryNumber, filePath: shardedPath, matched: arr };
+            
+            // Fast O(N) dedupe: First remove exact JSON duplicates to reduce size instantly
+            const seenStr = new Set();
+            const fastUnique = [];
+            for (const r of arr) {
+                if (!r) continue;
+                const s = JSON.stringify(r);
+                if (!seenStr.has(s)) {
+                    seenStr.add(s);
+                    fastUnique.push(r);
+                }
+            }
+            
+            // Second pass: apply semantic deduplication and assign .key
+            const matched = reportData.dedupeByKey(fastUnique);
+            
+            return { ok: true, queryNumber, filePath: shardedPath, matched };
         }
 
         if (!fs.existsSync(legacyPath)) {
@@ -680,6 +696,7 @@ async function searchPropertyIndex(loc, query) {
                         const key = reportData.fingerprint(record);
                         if (seenKey.has(key)) return;
                         seenKey.add(key);
+                        record.key = key;
                         matched.push(record);
                         return;
                     }
@@ -736,13 +753,13 @@ app.get('/api/search', async (req, res) => {
     const allowFull = Boolean(serverKey) && wantsFull && providedKey === serverKey;
 
     if (allowFull) {
-        const results = matched.map((row) => ({ ...row, key: reportData.fingerprint(row) }));
+        const results = matched.map((row) => ({ ...row, key: row.key || reportData.fingerprint(row) }));
         return res.json({ count: results.length, results, queryNumber });
     }
 
     const results = matched.map((row) => ({
         document_type: row.document_type || 'Unknown',
-        key: reportData.fingerprint(row)
+        key: row.key || reportData.fingerprint(row)
     }));
     return res.json({ count: results.length, results, queryNumber });
 });
@@ -1267,7 +1284,7 @@ app.get('/api/admin/search', requireAdminAuth, async (req, res) => {
         }
         return res.status(r.status).json({ error: r.error, details: r.details || undefined });
     }
-    const results = r.matched.map((row) => ({ ...row, key: reportData.fingerprint(row) }));
+    const results = r.matched.map((row) => ({ ...row, key: row.key || reportData.fingerprint(row) }));
     return res.json({ count: results.length, results, queryNumber: r.queryNumber });
 });
 

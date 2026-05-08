@@ -1,0 +1,18 @@
+[
+  {
+    "document_number": "55/2021",
+    "document_type": "हक्कसोडपत्र",
+    "registration_office": "उप निबंधक कार्यालय, आंबेगांव",
+    "date": "2021-02-10",
+    "seller_party": "शिवाजी गणपत काले",
+    "buyer_party": "पूजा शिवाजी काले",
+    "text": "Dummy record for local testing. Query match example: 572. (फेक डेटा)",
+    "property_numbers": [
+      {
+        "type": "survey_number",
+        "value": "572"
+      }
+    ],
+    "pdf_link": "https://example.com/fake-pdf/MSC_PUNE_AMBEGAON_ADIVARE_572.pdf"
+  }
+]
